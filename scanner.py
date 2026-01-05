@@ -139,20 +139,23 @@ def download_xray(cache_dir):
 
 
 def resolve_xray_binary(xray_bin):
+    if not xray_bin:
+        xray_bin = "xray"
     if os.path.isfile(xray_bin):
-        return xray_bin
+        return os.path.abspath(xray_bin)
     found = shutil.which(xray_bin)
     if found:
         return found
 
-    cwd = os.getcwd()
-    for filename in ("xray", "xray.exe"):
-        candidate = os.path.join(cwd, filename)
-        if os.path.isfile(candidate):
-            return candidate
+    search_dirs = [os.getcwd(), os.path.dirname(os.path.abspath(__file__))]
+    for directory in dict.fromkeys(search_dirs):
+        for filename in ("xray", "xray.exe"):
+            candidate = os.path.join(directory, filename)
+            if os.path.isfile(candidate):
+                return os.path.abspath(candidate)
 
     print("Xray binary not found. Downloading latest release for your platform...")
-    return download_xray(cwd)
+    return download_xray(os.path.dirname(os.path.abspath(__file__)))
 
 
 def validate_xray_config(xray_bin, config_text, show_message=True):
