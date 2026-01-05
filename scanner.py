@@ -14,6 +14,7 @@ import threading
 import time
 import urllib.request
 import zipfile
+import math
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -254,6 +255,14 @@ def test_upload(url, proxy, size_kb, min_kbps):
     return True, speed_kbps
 
 
+def select_download_bytes(options):
+    if options.download_bytes and options.download_bytes > 0:
+        return options.download_bytes
+    min_bytes = min(options.download_bytes_min, options.download_bytes_max)
+    max_bytes = max(options.download_bytes_min, options.download_bytes_max)
+    return random.randint(min_bytes, max_bytes)
+
+
 def ensure_test_file(path, size_mb):
     target_size = max(size_mb, 1) * 1024 * 1024
     directory = os.path.dirname(path) or "."
@@ -314,11 +323,12 @@ def scan_ip(ip_value, options):
     upload_speed = 0.0
     try:
         if options.download:
+            download_bytes = select_download_bytes(options)
             success, download_speed = test_download(
                 options.download_url,
                 options.proxy,
                 options.min_kbps,
-                options.download_bytes,
+                download_bytes,
             )
         if options.upload:
             upload_ok, upload_speed = test_upload(
@@ -444,6 +454,18 @@ def build_parser():
         "--download-bytes",
         type=int,
         default=1024 * 512,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--download-bytes-min",
+        type=int,
+        default=10 * 1024,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--download-bytes-max",
+        type=int,
+        default=1000 * 1024,
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -590,17 +612,15 @@ def configure_interactive(options):
                 "Local test file path",
                 default=os.path.join(DEFAULT_TEST_DIR, DEFAULT_TEST_FILENAME),
             )
-        options.test_file_size_mb = prompt_int(
-            "Local test file size (MB)",
-            options.test_file_size_mb,
-        )
+        min_size_mb = math.ceil(options.download_bytes_max / (1024 * 1024))
+        options.test_file_size_mb = max(options.test_file_size_mb, min_size_mb)
 
     options.xray_bin = prompt_text("Xray binary path", default=options.xray_bin)
     options.threads = prompt_int("Parallel threads", options.threads)
     options.proxy = prompt_text("Proxy URL", default=options.proxy)
     options.min_kbps = prompt_int("Minimum speed (KB/s)", options.min_kbps)
-    options.download_bytes = prompt_int("Download bytes per test", options.download_bytes)
     options.upload_size_kb = prompt_int("Upload size (KB)", options.upload_size_kb)
+    options.download_bytes = 0
     options.random = options.random or prompt_bool("Randomize IP order?", default=options.random)
     options.auto_skip = options.auto_skip or prompt_bool("Enable auto skip?", default=options.auto_skip)
     options.xray_startup_delay = prompt_float(
