@@ -406,6 +406,7 @@ def should_skip(range_size, scanned, success_count, start_time, auto_skip):
 
 def scan_range(label, items, options, output_lock, output_handle):
     range_size = len(items)
+    show_progress = range_size != 1
     if options.random:
         random.shuffle(items)
     if items:
@@ -421,7 +422,7 @@ def scan_range(label, items, options, output_lock, output_handle):
 
     def report_progress():
         nonlocal last_report
-        if range_size == 0:
+        if range_size == 0 or not show_progress:
             return
         now = time.time()
         if now - last_report < 0.5 and scanned < range_size:
@@ -468,6 +469,14 @@ def scan_range(label, items, options, output_lock, output_handle):
                                 f"{ip_value},{download_speed:.2f},{upload_speed:.2f}\n"
                             )
                             output_handle.flush()
+                    if not show_progress and ip_value is not None:
+                        if success:
+                            if options.download:
+                                print(f"{label}: ok - {download_speed:.2f} KB/s")
+                            else:
+                                print(f"{label}: ok")
+                        else:
+                            print(f"{label}: fail")
                     report_progress()
                     if should_skip(range_size, scanned, success_count, start_time, options.auto_skip):
                         print()
@@ -482,7 +491,8 @@ def scan_range(label, items, options, output_lock, output_handle):
                 future.cancel()
             print("\nScan interrupted by user. Partial results saved.")
             return
-    print()
+    if show_progress:
+        print()
 
 
 def build_parser():
