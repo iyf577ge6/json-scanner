@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import http.server
 import ipaddress
 import json
 import os
@@ -12,10 +13,13 @@ import threading
 import time
 import urllib.request
 import zipfile
+from functools import partial
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 XRAY_REPO_API = "https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+DEFAULT_TEST_DIR = os.path.join(os.path.expanduser("~"), ".json-scanner", "test-files")
+DEFAULT_TEST_FILENAME = "test.bin"
 
 
 def parse_ip_lines(path):
@@ -190,7 +194,7 @@ def run_curl(args, stdin_bytes=None, timeout=30):
     return result
 
 
-def test_download(url, proxy, min_kbps):
+def test_download(url, proxy, min_kbps, download_bytes):
     args = [
         "curl",
         "-o",
@@ -202,8 +206,10 @@ def test_download(url, proxy, min_kbps):
         proxy,
         "--max-time",
         "20",
-        url,
     ]
+    if download_bytes and download_bytes > 0:
+        args.extend(["--range", f"0-{download_bytes - 1}"])
+    args.append(url)
     result = run_curl(args)
     if result.returncode != 0:
         return False, 0.0
@@ -247,6 +253,55 @@ def test_upload(url, proxy, size_kb, min_kbps):
     return True, speed_kbps
 
 
+def ensure_test_file(path, size_mb):
+    target_size = max(size_mb, 1) * 1024 * 1024
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    if os.path.exists(path):
+        existing = os.path.getsize(path)
+        if existing >= target_size:
+            return
+    with open(path, "wb") as handle:
+        handle.truncate(target_size)
+
+
+class LocalTestHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
+    def do_POST(self):
+        self._discard_body()
+
+    def do_PUT(self):
+        self._discard_body()
+
+    def _discard_body(self):
+        length = self.headers.get("Content-Length")
+        if length:
+            remaining = int(length)
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 1024 * 32))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        else:
+            while True:
+                chunk = self.rfile.read(1024 * 32)
+                if not chunk:
+                    break
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+
+def start_local_test_server(directory, listen_host, port):
+    handler = partial(LocalTestHandler, directory=directory)
+    server = http.server.ThreadingHTTPServer((listen_host, port), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
 def scan_ip(ip_value, options):
     if options.stop_event.is_set():
         return ip_value, False, 0.0, 0.0
@@ -262,6 +317,7 @@ def scan_ip(ip_value, options):
                 options.download_url,
                 options.proxy,
                 options.min_kbps,
+                options.download_bytes,
             )
         if options.upload:
             upload_ok, upload_speed = test_upload(
@@ -372,8 +428,8 @@ def build_parser():
     parser.add_argument("-t", "--threads", type=int, default=10, help="Parallel threads")
     parser.add_argument("-d", "--download", action="store_true", help="Enable download test")
     parser.add_argument("-u", "--upload", action="store_true", help="Enable upload test")
-    parser.add_argument("-D", "--download-url", default="https://speed.hetzner.de/100MB.bin")
-    parser.add_argument("-U", "--upload-url", default="https://httpbin.org/post")
+    parser.add_argument("-D", "--download-url")
+    parser.add_argument("-U", "--upload-url")
     parser.add_argument("-S", "--upload-size-kb", type=int, default=256)
     parser.add_argument(
         "-s",
@@ -382,6 +438,44 @@ def build_parser():
         dest="min_kbps",
         default=0,
         help="Min speed KB/s",
+    )
+    parser.add_argument(
+        "--download-bytes",
+        type=int,
+        default=1024 * 512,
+        help="Download bytes per test (avoid full file download)",
+    )
+    parser.add_argument(
+        "--local-test-server",
+        action="store_true",
+        help="Run local test server for download/upload",
+    )
+    parser.add_argument(
+        "--local-test-host",
+        default="127.0.0.1",
+        help="Host/IP for generated test URLs",
+    )
+    parser.add_argument(
+        "--local-test-listen",
+        default="0.0.0.0",
+        help="Listen address for local test server",
+    )
+    parser.add_argument(
+        "--local-test-port",
+        type=int,
+        default=18080,
+        help="Port for local test server",
+    )
+    parser.add_argument(
+        "--test-file-path",
+        default=None,
+        help="Path to local test .bin file",
+    )
+    parser.add_argument(
+        "--test-file-size-mb",
+        type=int,
+        default=20,
+        help="Size of local test .bin file (MB)",
     )
     parser.add_argument("-r", "--random", action="store_true", help="Randomize IP order")
     parser.add_argument("-a", "--autoskip", action="store_true", help="Enable auto skip logic")
@@ -400,10 +494,40 @@ def main():
     if not options.download and not options.upload:
         parser.error("At least one of --download or --upload must be set.")
 
-    ranges = parse_ip_lines(options.ip_file)
-    output_lock = threading.Lock()
-
+    server = None
     try:
+        use_local_server = options.local_test_server or (
+            (options.download and not options.download_url)
+            or (options.upload and not options.upload_url)
+        )
+        if use_local_server:
+            test_file_path = options.test_file_path
+            if not test_file_path:
+                test_file_path = os.path.join(DEFAULT_TEST_DIR, DEFAULT_TEST_FILENAME)
+            ensure_test_file(test_file_path, options.test_file_size_mb)
+            server_directory = os.path.dirname(test_file_path) or "."
+            server = start_local_test_server(
+                server_directory,
+                options.local_test_listen,
+                options.local_test_port,
+            )
+            if options.download and not options.download_url:
+                options.download_url = (
+                    f"http://{options.local_test_host}:{options.local_test_port}/"
+                    f"{os.path.basename(test_file_path)}"
+                )
+            if options.upload and not options.upload_url:
+                options.upload_url = (
+                    f"http://{options.local_test_host}:{options.local_test_port}/upload"
+                )
+
+        if options.download and not options.download_url:
+            parser.error("Download test enabled but no download URL provided.")
+        if options.upload and not options.upload_url:
+            parser.error("Upload test enabled but no upload URL provided.")
+
+        ranges = parse_ip_lines(options.ip_file)
+        output_lock = threading.Lock()
         with open(options.out, "w", encoding="utf-8") as output_handle:
             for kind, label, items in ranges:
                 if options.stop_event.is_set():
@@ -412,6 +536,10 @@ def main():
     except KeyboardInterrupt:
         options.stop_event.set()
         print("\nاسکن توسط کاربر متوقف شد. نتایج تا همینجا ذخیره شده‌اند.")
+    finally:
+        if server:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":
