@@ -188,24 +188,36 @@ def run_xray(xray_bin, config_text):
     temp.write(config_text.encode("utf-8"))
     temp.flush()
     temp.close()
+    log_path = tempfile.NamedTemporaryFile(delete=False, suffix=".log").name
+    log_handle = open(log_path, "w", encoding="utf-8")
     process = subprocess.Popen(
         [xray_bin, "-c", temp.name],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=log_handle,
     )
-    return process, temp.name
+    log_handle.close()
+    return process, temp.name, log_path
 
 
-def stop_xray(process, config_path):
+def stop_xray(process, config_path, log_path):
     process.terminate()
     try:
         process.wait(timeout=3)
     except subprocess.TimeoutExpired:
         process.kill()
+    log_text = ""
+    if log_path and os.path.exists(log_path):
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as handle:
+            log_text = handle.read().strip()
+        try:
+            os.unlink(log_path)
+        except FileNotFoundError:
+            pass
     try:
         os.unlink(config_path)
     except FileNotFoundError:
         pass
+    return log_text
 
 
 def run_curl(args, stdin_bytes=None, timeout=30):
@@ -255,17 +267,23 @@ def test_download(url, proxy, min_kbps, download_bytes):
         args.extend(["--range", f"0-{download_bytes - 1}"])
     args.append(url)
     result = run_curl(args)
+    stdout = result.stdout.decode(errors="ignore").strip()
+    stderr = result.stderr.decode(errors="ignore").strip()
     if result.returncode != 0:
-        return False, 0.0
-    speed_bps, http_code = parse_curl_metrics(result.stdout.decode())
-    if speed_bps is None or not is_success_http_code(http_code):
-        return False, 0.0
+        error = stderr or f"curl exited with {result.returncode}"
+        return False, 0.0, None, error
+    speed_bps, http_code = parse_curl_metrics(stdout)
+    if speed_bps is None:
+        error = stderr or f"unexpected curl output: {stdout}"
+        return False, 0.0, http_code, error
+    if not is_success_http_code(http_code):
+        return False, 0.0, http_code, f"HTTP {http_code}"
     speed_kbps = speed_bps / 1024
     if speed_kbps <= 0:
-        return False, 0.0
+        return False, 0.0, http_code, "speed is zero"
     if min_kbps and speed_kbps < min_kbps:
-        return False, speed_kbps
-    return True, speed_kbps
+        return False, speed_kbps, http_code, f"below minimum ({min_kbps} KB/s)"
+    return True, speed_kbps, http_code, ""
 
 
 def test_upload(url, proxy, size_kb, min_kbps):
@@ -288,17 +306,23 @@ def test_upload(url, proxy, size_kb, min_kbps):
         url,
     ]
     result = run_curl(args, stdin_bytes=payload)
+    stdout = result.stdout.decode(errors="ignore").strip()
+    stderr = result.stderr.decode(errors="ignore").strip()
     if result.returncode != 0:
-        return False, 0.0
-    speed_bps, http_code = parse_curl_metrics(result.stdout.decode())
-    if speed_bps is None or not is_success_http_code(http_code):
-        return False, 0.0
+        error = stderr or f"curl exited with {result.returncode}"
+        return False, 0.0, None, error
+    speed_bps, http_code = parse_curl_metrics(stdout)
+    if speed_bps is None:
+        error = stderr or f"unexpected curl output: {stdout}"
+        return False, 0.0, http_code, error
+    if not is_success_http_code(http_code):
+        return False, 0.0, http_code, f"HTTP {http_code}"
     speed_kbps = speed_bps / 1024
     if speed_kbps <= 0:
-        return False, 0.0
+        return False, 0.0, http_code, "speed is zero"
     if min_kbps and speed_kbps < min_kbps:
-        return False, speed_kbps
-    return True, speed_kbps
+        return False, speed_kbps, http_code, f"below minimum ({min_kbps} KB/s)"
+    return True, speed_kbps, http_code, ""
 
 
 def select_download_bytes(options):
@@ -358,37 +382,106 @@ def start_local_test_server(directory, listen_host, port):
     return server
 
 
+def colorize(text, color):
+    if not sys.stdout.isatty():
+        return text
+    return f"{color}{text}\033[0m"
+
+
+def format_status_line(label, status_text, status_color, details=""):
+    columns = shutil.get_terminal_size((80, 20)).columns
+    plain_status = status_text
+    status = colorize(status_text, status_color)
+    left = label
+    if details:
+        left = f"{label} - {details}"
+    padding_width = max(10, columns - len(plain_status) - 1)
+    if len(left) > padding_width:
+        if padding_width > 1:
+            left = left[: padding_width - 1] + "…"
+        else:
+            left = left[:padding_width]
+    return f"{left:<{padding_width}} {status}"
+
+
+def format_http_code(code):
+    if code is None:
+        return "HTTP ?"
+    return f"HTTP {code}"
+
+
+def format_speed(speed_kbps):
+    return f"{speed_kbps:.2f} KB/s"
+
+
+def summarize_test(name, result, extra=""):
+    if result is None:
+        return f"{name}: skipped"
+    status = "ok" if result["ok"] else "fail"
+    speed = format_speed(result["speed_kbps"]) if result["speed_kbps"] else "0.00 KB/s"
+    code = format_http_code(result.get("http_code"))
+    message = result.get("error", "").strip()
+    detail_bits = [speed, code]
+    if extra:
+        detail_bits.append(extra)
+    detail = ", ".join(bit for bit in detail_bits if bit)
+    if message:
+        return f"{name}: {status} ({detail}) - {message}"
+    return f"{name}: {status} ({detail})"
+
+
 def scan_ip(ip_value, options):
     if options.stop_event.is_set():
-        return ip_value, False, 0.0, 0.0
+        return ip_value, False, 0.0, 0.0, {}
     config_text = render_config(options.config, ip_value)
-    process, config_path = run_xray(options.xray_bin, config_text)
+    process, config_path, log_path = run_xray(options.xray_bin, config_text)
     if options.xray_startup_delay > 0:
         time.sleep(options.xray_startup_delay)
+    if process.poll() is not None:
+        log_text = stop_xray(process, config_path, log_path)
+        details = {"xray_error": log_text or "Xray exited early."}
+        return ip_value, False, 0.0, 0.0, details
     success = True
     download_speed = 0.0
     upload_speed = 0.0
+    details = {}
     try:
         if options.download:
             download_bytes = select_download_bytes(options)
-            download_ok, download_speed = test_download(
+            download_ok, download_speed, http_code, error = test_download(
                 options.download_url,
                 options.proxy,
                 options.min_kbps,
                 download_bytes,
             )
+            details["download"] = {
+                "ok": download_ok,
+                "speed_kbps": download_speed,
+                "http_code": http_code,
+                "error": error,
+                "bytes": download_bytes,
+            }
             success = success and download_ok
         if options.upload:
-            upload_ok, upload_speed = test_upload(
+            upload_ok, upload_speed, http_code, error = test_upload(
                 options.upload_url,
                 options.proxy,
                 options.upload_size_kb,
                 options.min_kbps,
             )
+            details["upload"] = {
+                "ok": upload_ok,
+                "speed_kbps": upload_speed,
+                "http_code": http_code,
+                "error": error,
+                "size_kb": options.upload_size_kb,
+            }
             success = success and upload_ok
     finally:
-        stop_xray(process, config_path)
-    return ip_value, success, download_speed, upload_speed
+        xray_log = stop_xray(process, config_path, log_path)
+        if xray_log and not success:
+            details["xray_log"] = xray_log
+    return ip_value, success, download_speed, upload_speed, details
 
 
 def should_skip(range_size, scanned, success_count, start_time, auto_skip):
@@ -419,6 +512,12 @@ def scan_range(label, items, options, output_lock, output_handle):
     scanned = 0
     success_count = 0
     last_report = 0.0
+
+    def clear_progress_line():
+        if not show_progress:
+            return
+        columns = shutil.get_terminal_size((80, 20)).columns
+        print("\r" + (" " * (columns - 1)) + "\r", end="")
 
     def report_progress():
         nonlocal last_report
@@ -456,12 +555,13 @@ def scan_range(label, items, options, output_lock, output_handle):
                     futures.pop(future, None)
                     scanned += 1
                     try:
-                        ip_value, success, download_speed, upload_speed = future.result()
+                        ip_value, success, download_speed, upload_speed, details = future.result()
                     except Exception:
                         ip_value = None
                         success = False
                         download_speed = 0.0
                         upload_speed = 0.0
+                        details = {"error": "Unexpected worker failure."}
                     if success:
                         success_count += 1
                         with output_lock:
@@ -469,14 +569,48 @@ def scan_range(label, items, options, output_lock, output_handle):
                                 f"{ip_value},{download_speed:.2f},{upload_speed:.2f}\n"
                             )
                             output_handle.flush()
-                    if not show_progress and ip_value is not None:
-                        if success:
-                            if options.download:
-                                print(f"{label}: ok - {download_speed:.2f} KB/s")
+                    if ip_value is not None:
+                        clear_progress_line()
+                        status_text = "OK" if success else "FAIL"
+                        status_color = "\033[32m" if success else "\033[31m"
+                        summary_bits = []
+                        if options.download:
+                            if details.get("download"):
+                                summary_bits.append(
+                                    f"dl {format_speed(details['download']['speed_kbps'])}"
+                                )
                             else:
-                                print(f"{label}: ok")
-                        else:
-                            print(f"{label}: fail")
+                                summary_bits.append("dl -")
+                        if options.upload:
+                            if details.get("upload"):
+                                summary_bits.append(
+                                    f"ul {format_speed(details['upload']['speed_kbps'])}"
+                                )
+                            else:
+                                summary_bits.append("ul -")
+                        summary = " | ".join(summary_bits)
+                        print(
+                            format_status_line(
+                                str(ip_value),
+                                status_text,
+                                status_color,
+                                summary,
+                            )
+                        )
+                        if details.get("xray_error"):
+                            print(f"  xray: fail - {details['xray_error']}")
+                        if details.get("error"):
+                            print(f"  error: {details['error']}")
+                        if details.get("download"):
+                            extra = f"bytes {details['download']['bytes']}"
+                            print(summarize_test("  download", details["download"], extra=extra))
+                        if details.get("upload"):
+                            extra = f"size {details['upload']['size_kb']} KB"
+                            print(summarize_test("  upload", details["upload"], extra=extra))
+                        if details.get("xray_log"):
+                            print("  xray log:")
+                            for line in details["xray_log"].splitlines():
+                                print(f"    {line}")
                     report_progress()
                     if should_skip(range_size, scanned, success_count, start_time, options.auto_skip):
                         print()
@@ -715,11 +849,17 @@ def main():
             if not test_file_path:
                 test_file_path = os.path.join(DEFAULT_TEST_DIR, DEFAULT_TEST_FILENAME)
             ensure_test_file(test_file_path, options.test_file_size_mb)
+            file_size_mb = os.path.getsize(test_file_path) / (1024 * 1024)
             server_directory = os.path.dirname(test_file_path) or "."
             server = start_local_test_server(
                 server_directory,
                 options.local_test_listen,
                 options.local_test_port,
+            )
+            print(
+                "Local test server running "
+                f"on {options.local_test_listen}:{options.local_test_port} "
+                f"(file: {test_file_path}, {file_size_mb:.1f} MB)"
             )
             if options.download and not options.download_url:
                 options.download_url = (
@@ -735,6 +875,11 @@ def main():
             parser.error("Download test enabled but no download URL provided.")
         if options.upload and not options.upload_url:
             parser.error("Upload test enabled but no upload URL provided.")
+        if options.download:
+            print(f"Download URL: {options.download_url}")
+        if options.upload:
+            print(f"Upload URL: {options.upload_url}")
+        print(f"Proxy: {options.proxy}")
 
         ranges = parse_ip_lines(options.ip_file)
         output_lock = threading.Lock()
