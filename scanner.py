@@ -3,12 +3,19 @@ import argparse
 import ipaddress
 import json
 import os
+import platform
 import random
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+XRAY_REPO_API = "https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 
 
 def parse_ip_lines(path):
@@ -45,6 +52,105 @@ def render_config(template_path, ip_value):
     rendered = template.replace("PLACEHOLDER_IP", str(ip_value))
     json.loads(rendered)
     return rendered
+
+
+def platform_asset_name():
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+
+    if system == "linux":
+        if machine in {"x86_64", "amd64"}:
+            return "Xray-linux-64.zip"
+        if machine in {"aarch64", "arm64"}:
+            return "Xray-linux-arm64-v8a.zip"
+        if machine in {"armv7l", "armv7"}:
+            return "Xray-linux-arm32-v7a.zip"
+        if machine in {"armv6l", "armv6"}:
+            return "Xray-linux-arm32-v6.zip"
+    if system == "darwin":
+        if machine in {"x86_64", "amd64"}:
+            return "Xray-macos-64.zip"
+        if machine in {"arm64", "aarch64"}:
+            return "Xray-macos-arm64-v8a.zip"
+    if system == "windows":
+        if machine in {"x86_64", "amd64"}:
+            return "Xray-windows-64.zip"
+        if machine in {"arm64", "aarch64"}:
+            return "Xray-windows-arm64-v8a.zip"
+        if machine in {"x86", "i386", "i686"}:
+            return "Xray-windows-32.zip"
+    return None
+
+
+def download_xray(cache_dir):
+    asset_name = platform_asset_name()
+    if not asset_name:
+        raise RuntimeError("Unsupported platform for automatic Xray download.")
+
+    request = urllib.request.Request(XRAY_REPO_API, headers={"User-Agent": "json-scanner"})
+    with urllib.request.urlopen(request) as resp:
+        release = json.load(resp)
+    assets = {item["name"]: item["browser_download_url"] for item in release["assets"]}
+    if asset_name not in assets:
+        raise RuntimeError(f"Asset {asset_name} not found in latest release.")
+
+    target_dir = os.path.join(cache_dir, release["tag_name"], asset_name.replace(".zip", ""))
+    os.makedirs(target_dir, exist_ok=True)
+    binary_name = "xray.exe" if platform.system().lower() == "windows" else "xray"
+    binary_path = os.path.join(target_dir, binary_name)
+    if os.path.exists(binary_path):
+        return binary_path
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as temp_zip:
+        asset_request = urllib.request.Request(
+            assets[asset_name],
+            headers={"User-Agent": "json-scanner"},
+        )
+        with urllib.request.urlopen(asset_request) as resp:
+            temp_zip.write(resp.read())
+        temp_zip_path = temp_zip.name
+
+    with zipfile.ZipFile(temp_zip_path, "r") as archive:
+        archive.extractall(target_dir)
+
+    os.unlink(temp_zip_path)
+
+    if not os.path.exists(binary_path):
+        raise RuntimeError("Downloaded archive did not include xray binary.")
+
+    if platform.system().lower() != "windows":
+        os.chmod(binary_path, 0o755)
+
+    return binary_path
+
+
+def resolve_xray_binary(xray_bin):
+    if os.path.isfile(xray_bin):
+        return xray_bin
+    found = shutil.which(xray_bin)
+    if found:
+        return found
+
+    cache_dir = os.path.join(os.path.expanduser("~"), ".json-scanner", "xray")
+    if os.path.isdir(cache_dir):
+        for root, _, files in os.walk(cache_dir):
+            if "xray" in files:
+                return os.path.join(root, "xray")
+            if "xray.exe" in files:
+                return os.path.join(root, "xray.exe")
+
+    print("Xray binary پیدا نشد.")
+    choice = input("آیا مایلید Xray را به صورت خودکار دانلود کنیم؟ [Y/n]: ").strip().lower()
+    if choice in {"", "y", "yes"}:
+        os.makedirs(cache_dir, exist_ok=True)
+        return download_xray(cache_dir)
+
+    manual_path = input("مسیر کامل باینری Xray را وارد کنید: ").strip()
+    if not manual_path:
+        raise SystemExit("مسیر باینری وارد نشد.")
+    if not os.path.isfile(manual_path):
+        raise SystemExit("باینری Xray در مسیر اعلام شده پیدا نشد.")
+    return manual_path
 
 
 def run_xray(xray_bin, config_text):
@@ -142,6 +248,8 @@ def test_upload(url, proxy, size_kb, min_kbps):
 
 
 def scan_ip(ip_value, options):
+    if options.stop_event.is_set():
+        return ip_value, False, 0.0, 0.0
     config_text = render_config(options.config, ip_value)
     process, config_path = run_xray(options.xray_bin, config_text)
     time.sleep(options.xray_startup_delay)
@@ -188,12 +296,26 @@ def scan_range(label, items, options, output_lock, output_handle):
     start_time = time.time()
     scanned = 0
     success_count = 0
+    last_report = 0.0
+
+    def report_progress():
+        nonlocal last_report
+        if range_size == 0:
+            return
+        now = time.time()
+        if now - last_report < 0.5 and scanned < range_size:
+            return
+        percent = (scanned / range_size) * 100
+        print(f"\r{label}: {percent:5.1f}% ({scanned}/{range_size})", end="", flush=True)
+        last_report = now
 
     with ThreadPoolExecutor(max_workers=options.threads) as executor:
         futures = {}
         item_iter = iter(items)
 
         def submit_next():
+            if options.stop_event.is_set():
+                return False
             try:
                 ip_value = next(item_iter)
             except StopIteration:
@@ -206,30 +328,40 @@ def scan_range(label, items, options, output_lock, output_handle):
             if not submit_next():
                 break
 
-        while futures:
-            for future in as_completed(list(futures.keys()), timeout=None):
-                futures.pop(future, None)
-                scanned += 1
-                try:
-                    ip_value, success, download_speed, upload_speed = future.result()
-                except Exception:
-                    ip_value = None
-                    success = False
-                    download_speed = 0.0
-                    upload_speed = 0.0
-                if success:
-                    success_count += 1
-                    with output_lock:
-                        output_handle.write(
-                            f"{ip_value},{download_speed:.2f},{upload_speed:.2f}\n"
-                        )
-                        output_handle.flush()
-                if should_skip(range_size, scanned, success_count, start_time, options.auto_skip):
-                    return
-                if submit_next():
-                    continue
-            if not futures:
-                break
+        try:
+            while futures and not options.stop_event.is_set():
+                for future in as_completed(list(futures.keys()), timeout=None):
+                    futures.pop(future, None)
+                    scanned += 1
+                    try:
+                        ip_value, success, download_speed, upload_speed = future.result()
+                    except Exception:
+                        ip_value = None
+                        success = False
+                        download_speed = 0.0
+                        upload_speed = 0.0
+                    if success:
+                        success_count += 1
+                        with output_lock:
+                            output_handle.write(
+                                f"{ip_value},{download_speed:.2f},{upload_speed:.2f}\n"
+                            )
+                            output_handle.flush()
+                    report_progress()
+                    if should_skip(range_size, scanned, success_count, start_time, options.auto_skip):
+                        print()
+                        return
+                    if submit_next():
+                        continue
+                if not futures:
+                    break
+        except KeyboardInterrupt:
+            options.stop_event.set()
+            for future in futures:
+                future.cancel()
+            print("\nاسکن توسط کاربر متوقف شد. نتایج تا همینجا ذخیره شده‌اند.")
+            return
+    print()
 
 
 def build_parser():
@@ -255,6 +387,8 @@ def build_parser():
 def main():
     parser = build_parser()
     options = parser.parse_args()
+    options.stop_event = threading.Event()
+    options.xray_bin = resolve_xray_binary(options.xray_bin)
 
     if not options.download and not options.upload:
         parser.error("At least one of --download or --upload must be set.")
@@ -262,9 +396,15 @@ def main():
     ranges = parse_ip_lines(options.ip_file)
     output_lock = threading.Lock()
 
-    with open(options.out, "w", encoding="utf-8") as output_handle:
-        for kind, label, items in ranges:
-            scan_range(label, items, options, output_lock, output_handle)
+    try:
+        with open(options.out, "w", encoding="utf-8") as output_handle:
+            for kind, label, items in ranges:
+                if options.stop_event.is_set():
+                    break
+                scan_range(label, items, options, output_lock, output_handle)
+    except KeyboardInterrupt:
+        options.stop_event.set()
+        print("\nاسکن توسط کاربر متوقف شد. نتایج تا همینجا ذخیره شده‌اند.")
 
 
 if __name__ == "__main__":
