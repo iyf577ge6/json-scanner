@@ -457,11 +457,23 @@ class LocalTestHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
+    def copyfile(self, source, outputfile):
+        try:
+            super().copyfile(source, outputfile)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+
     def do_POST(self):
         self._discard_body()
 
     def do_PUT(self):
         self._discard_body()
+
+    def _safe_write(self, data):
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
 
     def _discard_body(self):
         length = self.headers.get("Content-Length")
@@ -479,7 +491,7 @@ class LocalTestHandler(http.server.SimpleHTTPRequestHandler):
                     break
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"OK")
+        self._safe_write(b"OK")
 
 
 def start_local_test_server(directory, listen_host, port):
