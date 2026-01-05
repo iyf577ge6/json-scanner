@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import urllib.parse
 import zipfile
 import math
 from functools import partial
@@ -248,6 +249,37 @@ def parse_curl_metrics(raw):
     return speed_bps, http_code
 
 
+def parse_proxy_host_port(proxy_url):
+    if not proxy_url:
+        return None, None
+    parts = urllib.parse.urlsplit(proxy_url)
+    if not parts.hostname:
+        return None, None
+    port = parts.port
+    if not port:
+        if parts.scheme.startswith("socks"):
+            port = 1080
+        elif parts.scheme == "http":
+            port = 8080
+    return parts.hostname, port
+
+
+def wait_for_proxy_ready(proxy_url, timeout):
+    host, port = parse_proxy_host_port(proxy_url)
+    if not host or not port or timeout <= 0:
+        return True
+    deadline = time.time() + timeout
+    last_error = None
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.2)
+    return False
+
+
 def is_success_http_code(code):
     return code is not None and code.isdigit() and 200 <= int(code) < 300
 
@@ -462,6 +494,13 @@ def scan_ip(ip_value, options):
     process, config_path, log_path = run_xray(options.xray_bin, config_text)
     if options.xray_startup_delay > 0:
         time.sleep(options.xray_startup_delay)
+    if not wait_for_proxy_ready(options.proxy, options.proxy_ready_timeout):
+        log_text = stop_xray(process, config_path, log_path)
+        details = {
+            "xray_error": log_text or "Xray proxy did not become ready in time.",
+            "error": "proxy not ready",
+        }
+        return ip_value, False, 0.0, 0.0, details
     if process.poll() is not None:
         log_text = stop_xray(process, config_path, log_path)
         details = {"xray_error": log_text or "Xray exited early."}
@@ -733,6 +772,12 @@ def build_parser():
     )
     parser.add_argument("-p", "--proxy", default="socks5h://127.0.0.1:10808")
     parser.add_argument("-w", "--xray-startup-delay", type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--proxy-ready-timeout",
+        type=float,
+        default=3.0,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("-o", "--out", default="success.txt", help="Output file")
     return parser
 
