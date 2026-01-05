@@ -17,6 +17,9 @@ import urllib.request
 import urllib.parse
 import zipfile
 import math
+import itertools
+from dataclasses import dataclass
+from datetime import datetime
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -24,6 +27,31 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 XRAY_REPO_API = "https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 DEFAULT_TEST_DIR = os.path.join(os.path.expanduser("~"), ".json-scanner", "test-files")
 DEFAULT_TEST_FILENAME = "test.bin"
+RESULTS_DIRNAME = "result"
+RANDOM_SHUFFLE_LIMIT = 100000
+CONNECT_TIMEOUT_SECONDS = 3
+MAX_TIME_SECONDS = 6
+
+
+@dataclass
+class IpRange:
+    kind: str
+    label: str
+    count: int
+    iter_factory: callable
+
+    def iter_ips(self):
+        return self.iter_factory()
+
+
+def count_network_hosts(network):
+    if network.version == 4:
+        if network.prefixlen >= 31:
+            return int(network.num_addresses)
+        return max(int(network.num_addresses) - 2, 0)
+    if network.prefixlen == 128:
+        return 1
+    return max(int(network.num_addresses) - 1, 0)
 
 
 def parse_ip_lines(path):
@@ -35,7 +63,15 @@ def parse_ip_lines(path):
                 continue
             if "/" in line:
                 network = ipaddress.ip_network(line, strict=False)
-                ranges.append(("cidr", line, list(network.hosts())))
+                count = count_network_hosts(network)
+                ranges.append(
+                    IpRange(
+                        "cidr",
+                        line,
+                        count,
+                        iter_factory=network.hosts,
+                    )
+                )
                 continue
             if "-" in line:
                 start_raw, end_raw = [part.strip() for part in line.split("-", 1)]
@@ -46,11 +82,26 @@ def parse_ip_lines(path):
                 if int(end) < int(start):
                     raise ValueError(f"Range end before start: {line}")
                 count = int(end) - int(start) + 1
-                items = [ipaddress.ip_address(int(start) + offset) for offset in range(count)]
-                ranges.append(("range", line, items))
+                ranges.append(
+                    IpRange(
+                        "range",
+                        line,
+                        count,
+                        iter_factory=lambda start=start, count=count: (
+                            ipaddress.ip_address(int(start) + offset) for offset in range(count)
+                        ),
+                    )
+                )
                 continue
             ip = ipaddress.ip_address(line)
-            ranges.append(("single", line, [ip]))
+            ranges.append(
+                IpRange(
+                    "single",
+                    line,
+                    1,
+                    iter_factory=lambda ip=ip: iter((ip,)),
+                )
+            )
     return ranges
 
 
@@ -295,9 +346,9 @@ def test_download(url, proxy, min_kbps, download_bytes):
         "--proxy",
         proxy,
         "--connect-timeout",
-        "5",
+        str(CONNECT_TIMEOUT_SECONDS),
         "--max-time",
-        "8",
+        str(MAX_TIME_SECONDS),
     ]
     if download_bytes and download_bytes > 0:
         args.extend(["--range", f"0-{download_bytes - 1}"])
@@ -334,9 +385,9 @@ def test_upload(url, proxy, size_kb, min_kbps):
         "--proxy",
         proxy,
         "--connect-timeout",
-        "5",
+        str(CONNECT_TIMEOUT_SECONDS),
         "--max-time",
-        "8",
+        str(MAX_TIME_SECONDS),
         "--data-binary",
         "@-",
         url,
@@ -561,14 +612,40 @@ def should_skip(range_size, scanned, success_count, start_time, auto_skip):
     return False
 
 
-def scan_range(label, items, options, output_lock, output_handle):
-    range_size = len(items)
-    show_progress = range_size != 1
-    if options.random:
+def format_result_line(ip_value, download_speed, upload_speed, options):
+    if options.download and options.upload:
+        return (
+            f"{ip_value},"
+            f"{format_speed(download_speed)},"
+            f"{format_speed(upload_speed)}"
+        )
+    if options.download:
+        return f"{ip_value},{format_speed(download_speed)}"
+    return f"{ip_value},{format_speed(upload_speed)}"
+
+
+def iter_range_items(range_item, options):
+    if options.random and range_item.count <= RANDOM_SHUFFLE_LIMIT:
+        items = list(range_item.iter_ips())
         random.shuffle(items)
-    if items:
+        return iter(items)
+    if options.random and range_item.count > RANDOM_SHUFFLE_LIMIT:
+        print(
+            f"{range_item.label}: random mode skipped for large range "
+            f"({range_item.count} IPs)."
+        )
+    return range_item.iter_ips()
+
+
+def scan_range(range_item, options, output_lock, output_handle):
+    range_size = range_item.count
+    show_progress = range_size != 1
+    if range_size:
         if not options.config_validated:
-            config_text = render_config(options.config, items[0])
+            first_ip = next(range_item.iter_ips(), None)
+            if first_ip is None:
+                return
+            config_text = render_config(options.config, first_ip)
             if not validate_xray_config(options.xray_bin, config_text, show_message=True):
                 return
             options.config_validated = True
@@ -596,7 +673,7 @@ def scan_range(label, items, options, output_lock, output_handle):
 
     with ThreadPoolExecutor(max_workers=options.threads) as executor:
         futures = {}
-        item_iter = iter(items)
+        item_iter = iter_range_items(range_item, options)
 
         def submit_next():
             if options.stop_event.is_set():
@@ -630,7 +707,7 @@ def scan_range(label, items, options, output_lock, output_handle):
                         success_count += 1
                         with output_lock:
                             output_handle.write(
-                                f"{ip_value},{download_speed:.2f},{upload_speed:.2f}\n"
+                                f"{format_result_line(ip_value, download_speed, upload_speed, options)}\n"
                             )
                             output_handle.flush()
                     if ip_value is not None:
@@ -693,6 +770,23 @@ def scan_range(label, items, options, output_lock, output_handle):
         print()
 
 
+def ensure_output_path(out_path):
+    if out_path:
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        return out_path
+    result_dir = os.path.join(os.getcwd(), RESULTS_DIRNAME)
+    os.makedirs(result_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    filename = f"{timestamp}.txt"
+    candidate = os.path.join(result_dir, filename)
+    if not os.path.exists(candidate):
+        return candidate
+    for suffix in itertools.count(1):
+        candidate = os.path.join(result_dir, f"{timestamp}-{suffix}.txt")
+        if not os.path.exists(candidate):
+            return candidate
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="IP scanner for Xray/V2Ray configs")
     parser.add_argument("-i", "--ip-file", help="Path to IP list file")
@@ -715,7 +809,7 @@ def build_parser():
     parser.add_argument(
         "--download-bytes",
         type=int,
-        default=1024 * 512,
+        default=1024 * 256,
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -778,7 +872,7 @@ def build_parser():
         default=3.0,
         help=argparse.SUPPRESS,
     )
-    parser.add_argument("-o", "--out", default="success.txt", help="Output file")
+    parser.add_argument("-o", "--out", default=None, help="Output file")
     return parser
 
 
@@ -892,7 +986,6 @@ def configure_interactive(options):
     options.download_bytes = 0
     options.random = options.random or prompt_bool("Randomize IP order?", default=options.random)
     options.auto_skip = options.auto_skip or prompt_bool("Enable auto skip?", default=options.auto_skip)
-    options.out = prompt_text("Output file", default=options.out)
     return options
 
 
@@ -904,6 +997,7 @@ def main():
     if len(sys.argv) == 1 or not options.ip_file or not options.config:
         options = configure_interactive(options)
     options.xray_bin = resolve_xray_binary(options.xray_bin)
+    options.out = ensure_output_path(options.out)
 
     if not options.download and not options.upload:
         parser.error("At least one of --download or --upload must be set.")
@@ -963,14 +1057,15 @@ def main():
         if options.upload:
             print(f"Upload URL: {options.upload_url}")
         print(f"Proxy: {options.proxy}")
+        print(f"Output: {options.out}")
 
         ranges = parse_ip_lines(options.ip_file)
         output_lock = threading.Lock()
         with open(options.out, "w", encoding="utf-8") as output_handle:
-            for kind, label, items in ranges:
+            for range_item in ranges:
                 if options.stop_event.is_set():
                     break
-                scan_range(label, items, options, output_lock, output_handle)
+                scan_range(range_item, options, output_lock, output_handle)
     except KeyboardInterrupt:
         options.stop_event.set()
         print("\nScan interrupted by user. Partial results saved.")
