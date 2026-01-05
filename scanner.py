@@ -640,6 +640,7 @@ def iter_range_items(range_item, options):
 def scan_range(range_item, options, output_lock, output_handle):
     range_size = range_item.count
     show_progress = range_size != 1
+    label = range_item.label
     if range_size:
         if not options.config_validated:
             first_ip = next(range_item.iter_ips(), None)
