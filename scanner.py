@@ -100,29 +100,36 @@ def download_xray(cache_dir):
     if asset_name not in assets:
         raise RuntimeError(f"Asset {asset_name} not found in latest release.")
 
-    target_dir = os.path.join(cache_dir, release["tag_name"], asset_name.replace(".zip", ""))
-    os.makedirs(target_dir, exist_ok=True)
     binary_name = "xray.exe" if platform.system().lower() == "windows" else "xray"
-    binary_path = os.path.join(target_dir, binary_name)
+    binary_path = os.path.join(cache_dir, binary_name)
     if os.path.exists(binary_path):
         return binary_path
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as temp_zip:
-        asset_request = urllib.request.Request(
-            assets[asset_name],
-            headers={"User-Agent": "json-scanner"},
-        )
-        with urllib.request.urlopen(asset_request) as resp:
-            temp_zip.write(resp.read())
-        temp_zip_path = temp_zip.name
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as temp_zip:
+            asset_request = urllib.request.Request(
+                assets[asset_name],
+                headers={"User-Agent": "json-scanner"},
+            )
+            with urllib.request.urlopen(asset_request) as resp:
+                temp_zip.write(resp.read())
+            temp_zip_path = temp_zip.name
 
-    with zipfile.ZipFile(temp_zip_path, "r") as archive:
-        archive.extractall(target_dir)
+        with zipfile.ZipFile(temp_zip_path, "r") as archive:
+            archive.extractall(temp_dir)
 
-    os.unlink(temp_zip_path)
+        os.unlink(temp_zip_path)
 
-    if not os.path.exists(binary_path):
-        raise RuntimeError("Downloaded archive did not include xray binary.")
+        extracted_binary = None
+        for root, _dirs, files in os.walk(temp_dir):
+            if binary_name in files:
+                extracted_binary = os.path.join(root, binary_name)
+                break
+
+        if not extracted_binary:
+            raise RuntimeError("Downloaded archive did not include xray binary.")
+
+        shutil.move(extracted_binary, binary_path)
 
     if platform.system().lower() != "windows":
         os.chmod(binary_path, 0o755)
@@ -147,7 +154,7 @@ def resolve_xray_binary(xray_bin):
     return download_xray(cwd)
 
 
-def validate_xray_config(xray_bin, config_text):
+def validate_xray_config(xray_bin, config_text, show_message=True):
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
     temp.write(config_text.encode("utf-8"))
     temp.flush()
@@ -165,7 +172,8 @@ def validate_xray_config(xray_bin, config_text):
         except FileNotFoundError:
             pass
     if result.returncode == 0:
-        print("config has valid syntax")
+        if show_message:
+            print("config has valid syntax")
         return True
     output = result.stderr.decode(errors="ignore").strip()
     if not output:
@@ -212,6 +220,22 @@ def run_curl(args, stdin_bytes=None, timeout=30):
     return result
 
 
+def parse_curl_metrics(raw):
+    parts = raw.strip().split()
+    if len(parts) != 2:
+        return None, None
+    try:
+        speed_bps = float(parts[0])
+    except ValueError:
+        return None, None
+    http_code = parts[1]
+    return speed_bps, http_code
+
+
+def is_success_http_code(code):
+    return code is not None and code.isdigit() and 200 <= int(code) < 300
+
+
 def test_download(url, proxy, min_kbps, download_bytes):
     args = [
         "curl",
@@ -219,11 +243,13 @@ def test_download(url, proxy, min_kbps, download_bytes):
         "/dev/null",
         "-s",
         "-w",
-        "%{speed_download}",
+        "%{speed_download} %{http_code}",
         "--proxy",
         proxy,
+        "--connect-timeout",
+        "5",
         "--max-time",
-        "20",
+        "8",
     ]
     if download_bytes and download_bytes > 0:
         args.extend(["--range", f"0-{download_bytes - 1}"])
@@ -231,11 +257,12 @@ def test_download(url, proxy, min_kbps, download_bytes):
     result = run_curl(args)
     if result.returncode != 0:
         return False, 0.0
-    try:
-        speed_bps = float(result.stdout.decode().strip())
-    except ValueError:
+    speed_bps, http_code = parse_curl_metrics(result.stdout.decode())
+    if speed_bps is None or not is_success_http_code(http_code):
         return False, 0.0
     speed_kbps = speed_bps / 1024
+    if speed_kbps <= 0:
+        return False, 0.0
     if min_kbps and speed_kbps < min_kbps:
         return False, speed_kbps
     return True, speed_kbps
@@ -249,11 +276,13 @@ def test_upload(url, proxy, size_kb, min_kbps):
         "/dev/null",
         "-s",
         "-w",
-        "%{speed_upload}",
+        "%{speed_upload} %{http_code}",
         "--proxy",
         proxy,
+        "--connect-timeout",
+        "5",
         "--max-time",
-        "20",
+        "8",
         "--data-binary",
         "@-",
         url,
@@ -261,11 +290,12 @@ def test_upload(url, proxy, size_kb, min_kbps):
     result = run_curl(args, stdin_bytes=payload)
     if result.returncode != 0:
         return False, 0.0
-    try:
-        speed_bps = float(result.stdout.decode().strip())
-    except ValueError:
+    speed_bps, http_code = parse_curl_metrics(result.stdout.decode())
+    if speed_bps is None or not is_success_http_code(http_code):
         return False, 0.0
     speed_kbps = speed_bps / 1024
+    if speed_kbps <= 0:
+        return False, 0.0
     if min_kbps and speed_kbps < min_kbps:
         return False, speed_kbps
     return True, speed_kbps
@@ -335,18 +365,19 @@ def scan_ip(ip_value, options):
     process, config_path = run_xray(options.xray_bin, config_text)
     if options.xray_startup_delay > 0:
         time.sleep(options.xray_startup_delay)
-    success = False
+    success = True
     download_speed = 0.0
     upload_speed = 0.0
     try:
         if options.download:
             download_bytes = select_download_bytes(options)
-            success, download_speed = test_download(
+            download_ok, download_speed = test_download(
                 options.download_url,
                 options.proxy,
                 options.min_kbps,
                 download_bytes,
             )
+            success = success and download_ok
         if options.upload:
             upload_ok, upload_speed = test_upload(
                 options.upload_url,
@@ -354,7 +385,7 @@ def scan_ip(ip_value, options):
                 options.upload_size_kb,
                 options.min_kbps,
             )
-            success = success or upload_ok
+            success = success and upload_ok
     finally:
         stop_xray(process, config_path)
     return ip_value, success, download_speed, upload_speed
@@ -378,9 +409,11 @@ def scan_range(label, items, options, output_lock, output_handle):
     if options.random:
         random.shuffle(items)
     if items:
-        config_text = render_config(options.config, items[0])
-        if not validate_xray_config(options.xray_bin, config_text):
-            return
+        if not options.config_validated:
+            config_text = render_config(options.config, items[0])
+            if not validate_xray_config(options.xray_bin, config_text, show_message=True):
+                return
+            options.config_validated = True
     start_time = time.time()
     scanned = 0
     success_count = 0
@@ -653,6 +686,7 @@ def main():
     parser = build_parser()
     options = parser.parse_args()
     options.stop_event = threading.Event()
+    options.config_validated = False
     if len(sys.argv) == 1 or not options.ip_file or not options.config:
         options = configure_interactive(options)
     options.xray_bin = resolve_xray_binary(options.xray_bin)
