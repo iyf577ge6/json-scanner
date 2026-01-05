@@ -593,10 +593,21 @@ def start_local_test_server(directory, listen_host, port):
     return server
 
 
+COLOR_RESET = "\033[0m"
+COLOR_BOLD = "\033[1m"
+COLOR_GREEN = "\033[32m"
+COLOR_RED = "\033[31m"
+COLOR_YELLOW = "\033[33m"
+COLOR_BLUE = "\033[34m"
+COLOR_BRIGHT_GREEN = "\033[92m"
+COLOR_BRIGHT_RED = "\033[91m"
+COLOR_BRIGHT_CYAN = "\033[96m"
+
+
 def colorize(text, color):
     if not sys.stdout.isatty():
         return text
-    return f"{color}{text}\033[0m"
+    return f"{color}{text}{COLOR_RESET}"
 
 
 def format_status_line(label, status_text, status_color, details=""):
@@ -613,6 +624,34 @@ def format_status_line(label, status_text, status_color, details=""):
         else:
             left = left[:padding_width]
     return f"{left:<{padding_width}} {status}"
+
+
+def format_status_bar(options):
+    if options.total_ips <= 0:
+        return ""
+    remaining = max(options.total_ips - options.total_scanned, 0)
+    percent = (options.total_scanned / options.total_ips) * 100
+    bar = f"Progress: {options.total_scanned}/{options.total_ips} ({percent:5.1f}%)"
+    bar = f"{bar} | Remaining: {remaining}"
+    return colorize(bar, COLOR_BRIGHT_CYAN)
+
+
+def clear_status_bar(options):
+    if not options.show_status_bar:
+        return
+    columns = shutil.get_terminal_size((80, 20)).columns
+    print("\r" + (" " * (columns - 1)) + "\r", end="")
+
+
+def render_status_bar(options):
+    if not options.show_status_bar:
+        return
+    bar = format_status_bar(options)
+    if not bar:
+        return
+    columns = shutil.get_terminal_size((80, 20)).columns
+    trimmed = bar[: max(columns - 1, 1)]
+    print("\r" + trimmed.ljust(columns - 1), end="", flush=True)
 
 
 def format_http_code(code):
@@ -632,7 +671,8 @@ def format_delay(delay_ms):
 def summarize_test(name, result, extra=""):
     if result is None:
         return f"{name}: skipped"
-    status = "ok" if result["ok"] else "fail"
+    status = "OK" if result["ok"] else "FAIL"
+    status_color = COLOR_GREEN if result["ok"] else COLOR_RED
     speed = format_speed(result["speed_kbps"]) if result["speed_kbps"] else "0.00 KB/s"
     code = format_http_code(result.get("http_code"))
     message = result.get("error", "").strip()
@@ -640,15 +680,17 @@ def summarize_test(name, result, extra=""):
     if extra:
         detail_bits.append(extra)
     detail = ", ".join(bit for bit in detail_bits if bit)
+    status_label = colorize(status, status_color)
     if message:
-        return f"{name}: {status} ({detail}) - {message}"
-    return f"{name}: {status} ({detail})"
+        return f"{name}: {status_label} ({detail}) - {message}"
+    return f"{name}: {status_label} ({detail})"
 
 
 def summarize_delay_test(name, result, extra=""):
     if result is None:
         return f"{name}: skipped"
-    status = "ok" if result["ok"] else "fail"
+    status = "OK" if result["ok"] else "FAIL"
+    status_color = COLOR_GREEN if result["ok"] else COLOR_RED
     delay = format_delay(result["delay_ms"]) if result["delay_ms"] else "0.00 ms"
     code = format_http_code(result.get("http_code"))
     message = result.get("error", "").strip()
@@ -656,9 +698,22 @@ def summarize_delay_test(name, result, extra=""):
     if extra:
         detail_bits.append(extra)
     detail = ", ".join(bit for bit in detail_bits if bit)
+    status_label = colorize(status, status_color)
     if message:
-        return f"{name}: {status} ({detail}) - {message}"
-    return f"{name}: {status} ({detail})"
+        return f"{name}: {status_label} ({detail}) - {message}"
+    return f"{name}: {status_label} ({detail})"
+
+
+def filter_xray_log(log_text):
+    if not log_text:
+        return ""
+    filtered_lines = []
+    for line in log_text.splitlines():
+        lower_line = line.lower()
+        if "xray" in lower_line and "started" in lower_line:
+            continue
+        filtered_lines.append(line)
+    return "\n".join(filtered_lines).strip()
 
 
 def scan_ip(ip_value, options):
@@ -674,14 +729,14 @@ def scan_ip(ip_value, options):
         if options.xray_startup_delay > 0:
             time.sleep(options.xray_startup_delay)
         if not wait_for_proxy_ready(proxy_url, options.proxy_ready_timeout):
-            log_text = stop_xray(process, config_path, log_path)
+            log_text = filter_xray_log(stop_xray(process, config_path, log_path))
             details = {
                 "xray_error": log_text or "Xray proxy did not become ready in time.",
                 "error": "proxy not ready",
             }
             return ip_value, False, 0.0, 0.0, details
         if process.poll() is not None:
-            log_text = stop_xray(process, config_path, log_path)
+            log_text = filter_xray_log(stop_xray(process, config_path, log_path))
             details = {"xray_error": log_text or "Xray exited early."}
             return ip_value, False, 0.0, 0.0, details
         success = True
@@ -742,7 +797,9 @@ def scan_ip(ip_value, options):
         finally:
             xray_log = stop_xray(process, config_path, log_path)
             if xray_log and not success:
-                details["xray_log"] = xray_log
+                filtered_log = filter_xray_log(xray_log)
+                if filtered_log:
+                    details["xray_log"] = filtered_log
         return ip_value, success, download_speed, upload_speed, delay_ms, details
     finally:
         if options.dynamic_proxy:
@@ -788,7 +845,6 @@ def iter_range_items(range_item, options):
 
 def scan_range(range_item, options, output_lock, output_handle):
     range_size = range_item.count
-    show_progress = range_size != 1
     label = range_item.label
     if range_size:
         if not options.config_validated:
@@ -806,24 +862,6 @@ def scan_range(range_item, options, output_lock, output_handle):
     start_time = time.time()
     scanned = 0
     success_count = 0
-    last_report = 0.0
-
-    def clear_progress_line():
-        if not show_progress:
-            return
-        columns = shutil.get_terminal_size((80, 20)).columns
-        print("\r" + (" " * (columns - 1)) + "\r", end="")
-
-    def report_progress():
-        nonlocal last_report
-        if range_size == 0 or not show_progress:
-            return
-        now = time.time()
-        if now - last_report < 0.5 and scanned < range_size:
-            return
-        percent = (scanned / range_size) * 100
-        print(f"\r{label}: {percent:5.1f}% ({scanned}/{range_size})", end="", flush=True)
-        last_report = now
 
     with ThreadPoolExecutor(max_workers=options.threads) as executor:
         futures = {}
@@ -873,9 +911,13 @@ def scan_range(range_item, options, output_lock, output_handle):
                             )
                             output_handle.flush()
                     if ip_value is not None:
-                        clear_progress_line()
+                        clear_status_bar(options)
                         status_text = "OK" if success else "FAIL"
-                        status_color = "\033[32m" if success else "\033[31m"
+                        status_color = (
+                            f"{COLOR_BOLD}{COLOR_BRIGHT_GREEN}"
+                            if success
+                            else f"{COLOR_BOLD}{COLOR_BRIGHT_RED}"
+                        )
                         summary_bits = []
                         if options.download:
                             if details.get("download"):
@@ -908,9 +950,12 @@ def scan_range(range_item, options, output_lock, output_handle):
                             )
                         )
                         if details.get("xray_error"):
-                            print(f"  xray: fail - {details['xray_error']}")
+                            print(
+                                f"  {colorize('xray', COLOR_YELLOW)}: "
+                                f"{colorize('FAIL', COLOR_RED)} - {details['xray_error']}"
+                            )
                         if details.get("error"):
-                            print(f"  error: {details['error']}")
+                            print(f"  {colorize('error', COLOR_RED)}: {details['error']}")
                         if details.get("download"):
                             extra = f"bytes {details['download']['bytes']}"
                             print(summarize_test("  download", details["download"], extra=extra))
@@ -920,11 +965,14 @@ def scan_range(range_item, options, output_lock, output_handle):
                         if details.get("real_delay"):
                             print(summarize_delay_test("  real delay", details["real_delay"]))
                         if details.get("xray_log"):
-                            print("  xray log:")
+                            print(f"  {colorize('xray log', COLOR_BLUE)}:")
                             for line in details["xray_log"].splitlines():
                                 print(f"    {line}")
-                    report_progress()
+                    with options.progress_lock:
+                        options.total_scanned += 1
+                    render_status_bar(options)
                     if should_skip(range_size, scanned, success_count, start_time, options.auto_skip):
+                        clear_status_bar(options)
                         print()
                         return
                     if submit_next():
@@ -935,10 +983,11 @@ def scan_range(range_item, options, output_lock, output_handle):
             options.stop_event.set()
             for future in futures:
                 future.cancel()
+            clear_status_bar(options)
             print("\nScan interrupted by user. Partial results saved.")
             return
-    if show_progress:
-        print()
+    clear_status_bar(options)
+    print()
 
 
 def ensure_output_path(out_path):
@@ -1123,9 +1172,10 @@ def configure_interactive(options):
         options.config = prompt_text("Xray JSON template path", required=True)
 
     if not options.download and not options.upload and not options.real_delay:
-        options.download = prompt_bool("Enable download test?", default=True)
-        options.upload = prompt_bool("Enable upload test?", default=False)
         options.real_delay = prompt_bool("Enable real delay test?", default=False)
+        if not options.real_delay:
+            options.download = prompt_bool("Enable download test?", default=True)
+        options.upload = prompt_bool("Enable upload test?", default=False)
         if not options.download and not options.upload and not options.real_delay:
             print("At least one test must be enabled.")
             options.download = True
@@ -1193,6 +1243,10 @@ def main():
     options = parser.parse_args()
     options.stop_event = threading.Event()
     options.config_validated = False
+    options.progress_lock = threading.Lock()
+    options.total_scanned = 0
+    options.total_ips = 0
+    options.show_status_bar = True
     if len(sys.argv) == 1 or not options.ip_file or not options.config:
         options = configure_interactive(options)
     options.config_template = load_config_template(options.config)
@@ -1297,7 +1351,11 @@ def main():
         print(f"Output: {options.out}")
 
         ranges = parse_ip_lines(options.ip_file)
+        options.total_ips = sum(range_item.count for range_item in ranges)
         output_lock = threading.Lock()
+        if options.total_ips:
+            print(colorize("Xray core started. Logs will show only on errors.", COLOR_BLUE))
+            print(colorize(f"Total IPs: {options.total_ips}", COLOR_BRIGHT_CYAN))
         with open(options.out, "w", encoding="utf-8") as output_handle:
             for range_item in ranges:
                 if options.stop_event.is_set():
@@ -1305,6 +1363,7 @@ def main():
                 scan_range(range_item, options, output_lock, output_handle)
     except KeyboardInterrupt:
         options.stop_event.set()
+        clear_status_bar(options)
         print("\nScan interrupted by user. Partial results saved.")
     finally:
         if server:
