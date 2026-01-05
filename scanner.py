@@ -8,6 +8,7 @@ import platform
 import random
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -143,17 +144,17 @@ def resolve_xray_binary(xray_bin):
             if "xray.exe" in files:
                 return os.path.join(root, "xray.exe")
 
-    print("Xray binary پیدا نشد.")
-    choice = input("آیا مایلید Xray را به صورت خودکار دانلود کنیم؟ [Y/n]: ").strip().lower()
+    print("Xray binary not found.")
+    choice = input("Download Xray automatically? [Y/n]: ").strip().lower()
     if choice in {"", "y", "yes"}:
         os.makedirs(cache_dir, exist_ok=True)
         return download_xray(cache_dir)
 
-    manual_path = input("مسیر کامل باینری Xray را وارد کنید: ").strip()
+    manual_path = input("Enter the full path to the Xray binary: ").strip()
     if not manual_path:
-        raise SystemExit("مسیر باینری وارد نشد.")
+        raise SystemExit("No binary path provided.")
     if not os.path.isfile(manual_path):
-        raise SystemExit("باینری Xray در مسیر اعلام شده پیدا نشد.")
+        raise SystemExit("Xray binary not found at the provided path.")
     return manual_path
 
 
@@ -415,15 +416,15 @@ def scan_range(label, items, options, output_lock, output_handle):
             options.stop_event.set()
             for future in futures:
                 future.cancel()
-            print("\nاسکن توسط کاربر متوقف شد. نتایج تا همینجا ذخیره شده‌اند.")
+            print("\nScan interrupted by user. Partial results saved.")
             return
     print()
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description="IP scanner for Xray/V2Ray configs")
-    parser.add_argument("-i", "--ip-file", required=True, help="Path to IP list file")
-    parser.add_argument("-c", "--config", required=True, help="Path to Xray JSON template")
+    parser.add_argument("-i", "--ip-file", help="Path to IP list file")
+    parser.add_argument("-c", "--config", help="Path to Xray JSON template")
     parser.add_argument("-x", "--xray-bin", default="xray", help="Path to Xray binary")
     parser.add_argument("-t", "--threads", type=int, default=10, help="Parallel threads")
     parser.add_argument("-d", "--download", action="store_true", help="Enable download test")
@@ -443,52 +444,179 @@ def build_parser():
         "--download-bytes",
         type=int,
         default=1024 * 512,
-        help="Download bytes per test (avoid full file download)",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--local-test-server",
         action="store_true",
-        help="Run local test server for download/upload",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--local-test-host",
         default="127.0.0.1",
-        help="Host/IP for generated test URLs",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--local-test-listen",
         default="0.0.0.0",
-        help="Listen address for local test server",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--local-test-port",
         type=int,
         default=18080,
-        help="Port for local test server",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--test-file-path",
         default=None,
-        help="Path to local test .bin file",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--test-file-size-mb",
         type=int,
         default=20,
-        help="Size of local test .bin file (MB)",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("-r", "--random", action="store_true", help="Randomize IP order")
-    parser.add_argument("-a", "--autoskip", action="store_true", help="Enable auto skip logic")
+    parser.add_argument(
+        "-a",
+        "--autoskip",
+        dest="auto_skip",
+        action="store_true",
+        help="Enable auto skip logic",
+    )
     parser.add_argument("-p", "--proxy", default="socks5h://127.0.0.1:10808")
-    parser.add_argument("-w", "--xray-startup-delay", type=float, default=0.5)
+    parser.add_argument("-w", "--xray-startup-delay", type=float, default=0.5, help=argparse.SUPPRESS)
     parser.add_argument("-o", "--out", default="success.txt", help="Output file")
     return parser
+
+
+def prompt_text(prompt, default=None, required=False, validator=None):
+    while True:
+        suffix = f" [{default}]" if default not in (None, "") else ""
+        value = input(f"{prompt}{suffix}: ").strip()
+        if value == "" and default not in (None, ""):
+            value = str(default)
+        if value == "" and required:
+            print("Value is required.")
+            continue
+        if value != "" and validator:
+            try:
+                validator(value)
+            except ValueError as exc:
+                print(exc)
+                continue
+        return value
+
+
+def prompt_int(prompt, default):
+    while True:
+        value = prompt_text(prompt, default=str(default))
+        try:
+            return int(value)
+        except ValueError:
+            print("Please enter a valid number.")
+
+
+def prompt_float(prompt, default):
+    while True:
+        value = prompt_text(prompt, default=str(default))
+        try:
+            return float(value)
+        except ValueError:
+            print("Please enter a valid number.")
+
+
+def prompt_bool(prompt, default=False):
+    default_label = "Y/n" if default else "y/N"
+    while True:
+        value = input(f"{prompt} [{default_label}]: ").strip().lower()
+        if value == "":
+            return default
+        if value in {"y", "yes"}:
+            return True
+        if value in {"n", "no"}:
+            return False
+        print("Please enter yes or no.")
+
+
+def configure_interactive(options):
+    print("Interactive setup:")
+    if not options.ip_file:
+        options.ip_file = prompt_text("IP list file path", required=True)
+    if not options.config:
+        options.config = prompt_text("Xray JSON template path", required=True)
+
+    if not options.download and not options.upload:
+        options.download = prompt_bool("Enable download test?", default=True)
+        options.upload = prompt_bool("Enable upload test?", default=False)
+        if not options.download and not options.upload:
+            print("At least one test must be enabled.")
+            options.download = True
+
+    if options.download and not options.download_url:
+        options.download_url = prompt_text(
+            "Download test URL (leave blank to use local server)",
+            default="",
+        )
+
+    if options.upload and not options.upload_url:
+        options.upload_url = prompt_text(
+            "Upload test URL (leave blank to use local server)",
+            default="",
+        )
+
+    options.local_test_server = options.local_test_server or (
+        (options.download and not options.download_url)
+        or (options.upload and not options.upload_url)
+    )
+
+    if options.local_test_server:
+        options.local_test_host = prompt_text(
+            "Local test host for generated URLs",
+            default=options.local_test_host,
+        )
+        options.local_test_listen = prompt_text(
+            "Local test listen address",
+            default=options.local_test_listen,
+        )
+        options.local_test_port = prompt_int(
+            "Local test server port",
+            options.local_test_port,
+        )
+        if not options.test_file_path:
+            options.test_file_path = prompt_text(
+                "Local test file path",
+                default=os.path.join(DEFAULT_TEST_DIR, DEFAULT_TEST_FILENAME),
+            )
+        options.test_file_size_mb = prompt_int(
+            "Local test file size (MB)",
+            options.test_file_size_mb,
+        )
+
+    options.xray_bin = prompt_text("Xray binary path", default=options.xray_bin)
+    options.threads = prompt_int("Parallel threads", options.threads)
+    options.proxy = prompt_text("Proxy URL", default=options.proxy)
+    options.min_kbps = prompt_int("Minimum speed (KB/s)", options.min_kbps)
+    options.download_bytes = prompt_int("Download bytes per test", options.download_bytes)
+    options.upload_size_kb = prompt_int("Upload size (KB)", options.upload_size_kb)
+    options.random = options.random or prompt_bool("Randomize IP order?", default=options.random)
+    options.auto_skip = options.auto_skip or prompt_bool("Enable auto skip?", default=options.auto_skip)
+    options.xray_startup_delay = prompt_float(
+        "Xray startup delay (seconds)",
+        options.xray_startup_delay,
+    )
+    options.out = prompt_text("Output file", default=options.out)
+    return options
 
 
 def main():
     parser = build_parser()
     options = parser.parse_args()
     options.stop_event = threading.Event()
+    if len(sys.argv) == 1 or not options.ip_file or not options.config:
+        options = configure_interactive(options)
     options.xray_bin = resolve_xray_binary(options.xray_bin)
 
     if not options.download and not options.upload:
@@ -535,7 +663,7 @@ def main():
                 scan_range(label, items, options, output_lock, output_handle)
     except KeyboardInterrupt:
         options.stop_event.set()
-        print("\nاسکن توسط کاربر متوقف شد. نتایج تا همینجا ذخیره شده‌اند.")
+        print("\nScan interrupted by user. Partial results saved.")
     finally:
         if server:
             server.shutdown()
