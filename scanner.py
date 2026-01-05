@@ -323,6 +323,17 @@ def parse_proxy_host_port(proxy_url):
     return parts.hostname, port
 
 
+def parse_url_lines(path):
+    urls = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            urls.append(line)
+    return urls
+
+
 class PortAllocator:
     def __init__(self):
         self._lock = threading.Lock()
@@ -618,8 +629,12 @@ def scan_ip(ip_value, options):
         try:
             if options.download:
                 download_bytes = select_download_bytes(options)
+                download_url = options.download_url
+                if options.download_url_cycle is not None:
+                    with options.download_url_lock:
+                        download_url = next(options.download_url_cycle)
                 download_ok, download_speed, http_code, error = test_download(
-                    options.download_url,
+                    download_url,
                     proxy_url,
                     options.min_kbps,
                     download_bytes,
@@ -630,6 +645,7 @@ def scan_ip(ip_value, options):
                     "http_code": http_code,
                     "error": error,
                     "bytes": download_bytes,
+                    "url": download_url,
                 }
                 success = success and download_ok
             if options.upload:
@@ -859,6 +875,10 @@ def build_parser():
     parser.add_argument("-d", "--download", action="store_true", help="Enable download test")
     parser.add_argument("-u", "--upload", action="store_true", help="Enable upload test")
     parser.add_argument("-D", "--download-url")
+    parser.add_argument(
+        "--download-url-list",
+        help="Path to a file with one download URL per line (round-robin)",
+    )
     parser.add_argument("-U", "--upload-url")
     parser.add_argument("-S", "--upload-size-kb", type=int, default=256)
     parser.add_argument(
@@ -1081,6 +1101,17 @@ def main():
     options.validation_socks_port = options.static_socks_port or DEFAULT_SOCKS_PORT
     options.xray_bin = resolve_xray_binary(options.xray_bin)
     options.out = ensure_output_path(options.out)
+    options.download_urls = []
+    options.download_url_cycle = None
+    options.download_url_lock = threading.Lock()
+    if options.download_url and options.download_url_list:
+        parser.error("Use either --download-url or --download-url-list, not both.")
+    if options.download_url_list:
+        options.download_urls = parse_url_lines(options.download_url_list)
+        if not options.download_urls:
+            parser.error("Download URL list is empty.")
+        options.download_url = options.download_urls[0]
+        options.download_url_cycle = itertools.cycle(options.download_urls)
 
     if not options.download and not options.upload:
         parser.error("At least one of --download or --upload must be set.")
@@ -1137,6 +1168,11 @@ def main():
             parser.error("Upload test enabled but no upload URL provided.")
         if options.download:
             print(f"Download URL: {options.download_url}")
+            if options.download_url_cycle is not None:
+                print(
+                    f"Download URL list: {options.download_url_list} "
+                    f"({len(options.download_urls)} entries)"
+                )
         if options.upload:
             print(f"Upload URL: {options.upload_url}")
         if options.dynamic_proxy:
