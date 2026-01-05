@@ -31,6 +31,7 @@ RESULTS_DIRNAME = "result"
 RANDOM_SHUFFLE_LIMIT = 100000
 CONNECT_TIMEOUT_SECONDS = 3
 MAX_TIME_SECONDS = 6
+DEFAULT_SOCKS_PORT = 10808
 
 
 @dataclass
@@ -105,10 +106,17 @@ def parse_ip_lines(path):
     return ranges
 
 
-def render_config(template_path, ip_value):
+def load_config_template(template_path):
     with open(template_path, "r", encoding="utf-8") as handle:
-        template = handle.read()
-    rendered = template.replace("PLACEHOLDER_IP", str(ip_value))
+        return handle.read()
+
+
+def render_config(template_text, ip_value, socks_port=None):
+    rendered = template_text.replace("PLACEHOLDER_IP", str(ip_value))
+    if "PLACEHOLDER_PORT" in rendered:
+        if socks_port is None:
+            raise ValueError("PLACEHOLDER_PORT is present but no socks port was provided.")
+        rendered = rendered.replace("PLACEHOLDER_PORT", str(socks_port))
     json.loads(rendered)
     return rendered
 
@@ -313,6 +321,36 @@ def parse_proxy_host_port(proxy_url):
         elif parts.scheme == "http":
             port = 8080
     return parts.hostname, port
+
+
+class PortAllocator:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._in_use = set()
+
+    def acquire(self):
+        while True:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            with self._lock:
+                if port not in self._in_use:
+                    self._in_use.add(port)
+                    return port
+
+    def release(self, port):
+        if port is None:
+            return
+        with self._lock:
+            self._in_use.discard(port)
+
+
+def build_proxy_url(proxy_template, socks_port):
+    if not proxy_template:
+        return proxy_template
+    if "{port}" in proxy_template:
+        return proxy_template.format(port=socks_port)
+    return proxy_template
 
 
 def wait_for_proxy_ready(proxy_url, timeout):
@@ -553,62 +591,70 @@ def summarize_test(name, result, extra=""):
 def scan_ip(ip_value, options):
     if options.stop_event.is_set():
         return ip_value, False, 0.0, 0.0, {}
-    config_text = render_config(options.config, ip_value)
-    process, config_path, log_path = run_xray(options.xray_bin, config_text)
-    if options.xray_startup_delay > 0:
-        time.sleep(options.xray_startup_delay)
-    if not wait_for_proxy_ready(options.proxy, options.proxy_ready_timeout):
-        log_text = stop_xray(process, config_path, log_path)
-        details = {
-            "xray_error": log_text or "Xray proxy did not become ready in time.",
-            "error": "proxy not ready",
-        }
-        return ip_value, False, 0.0, 0.0, details
-    if process.poll() is not None:
-        log_text = stop_xray(process, config_path, log_path)
-        details = {"xray_error": log_text or "Xray exited early."}
-        return ip_value, False, 0.0, 0.0, details
-    success = True
-    download_speed = 0.0
-    upload_speed = 0.0
-    details = {}
+    socks_port = options.static_socks_port
+    if options.dynamic_proxy:
+        socks_port = options.port_allocator.acquire()
+    proxy_url = build_proxy_url(options.proxy, socks_port)
     try:
-        if options.download:
-            download_bytes = select_download_bytes(options)
-            download_ok, download_speed, http_code, error = test_download(
-                options.download_url,
-                options.proxy,
-                options.min_kbps,
-                download_bytes,
-            )
-            details["download"] = {
-                "ok": download_ok,
-                "speed_kbps": download_speed,
-                "http_code": http_code,
-                "error": error,
-                "bytes": download_bytes,
+        config_text = render_config(options.config_template, ip_value, socks_port)
+        process, config_path, log_path = run_xray(options.xray_bin, config_text)
+        if options.xray_startup_delay > 0:
+            time.sleep(options.xray_startup_delay)
+        if not wait_for_proxy_ready(proxy_url, options.proxy_ready_timeout):
+            log_text = stop_xray(process, config_path, log_path)
+            details = {
+                "xray_error": log_text or "Xray proxy did not become ready in time.",
+                "error": "proxy not ready",
             }
-            success = success and download_ok
-        if options.upload:
-            upload_ok, upload_speed, http_code, error = test_upload(
-                options.upload_url,
-                options.proxy,
-                options.upload_size_kb,
-                options.min_kbps,
-            )
-            details["upload"] = {
-                "ok": upload_ok,
-                "speed_kbps": upload_speed,
-                "http_code": http_code,
-                "error": error,
-                "size_kb": options.upload_size_kb,
-            }
-            success = success and upload_ok
+            return ip_value, False, 0.0, 0.0, details
+        if process.poll() is not None:
+            log_text = stop_xray(process, config_path, log_path)
+            details = {"xray_error": log_text or "Xray exited early."}
+            return ip_value, False, 0.0, 0.0, details
+        success = True
+        download_speed = 0.0
+        upload_speed = 0.0
+        details = {}
+        try:
+            if options.download:
+                download_bytes = select_download_bytes(options)
+                download_ok, download_speed, http_code, error = test_download(
+                    options.download_url,
+                    proxy_url,
+                    options.min_kbps,
+                    download_bytes,
+                )
+                details["download"] = {
+                    "ok": download_ok,
+                    "speed_kbps": download_speed,
+                    "http_code": http_code,
+                    "error": error,
+                    "bytes": download_bytes,
+                }
+                success = success and download_ok
+            if options.upload:
+                upload_ok, upload_speed, http_code, error = test_upload(
+                    options.upload_url,
+                    proxy_url,
+                    options.upload_size_kb,
+                    options.min_kbps,
+                )
+                details["upload"] = {
+                    "ok": upload_ok,
+                    "speed_kbps": upload_speed,
+                    "http_code": http_code,
+                    "error": error,
+                    "size_kb": options.upload_size_kb,
+                }
+                success = success and upload_ok
+        finally:
+            xray_log = stop_xray(process, config_path, log_path)
+            if xray_log and not success:
+                details["xray_log"] = xray_log
+        return ip_value, success, download_speed, upload_speed, details
     finally:
-        xray_log = stop_xray(process, config_path, log_path)
-        if xray_log and not success:
-            details["xray_log"] = xray_log
-    return ip_value, success, download_speed, upload_speed, details
+        if options.dynamic_proxy:
+            options.port_allocator.release(socks_port)
 
 
 def should_skip(range_size, scanned, success_count, start_time, auto_skip):
@@ -658,7 +704,11 @@ def scan_range(range_item, options, output_lock, output_handle):
             first_ip = next(range_item.iter_ips(), None)
             if first_ip is None:
                 return
-            config_text = render_config(options.config, first_ip)
+            config_text = render_config(
+                options.config_template,
+                first_ip,
+                options.validation_socks_port,
+            )
             if not validate_xray_config(options.xray_bin, config_text, show_message=True):
                 return
             options.config_validated = True
@@ -877,7 +927,12 @@ def build_parser():
         action="store_true",
         help="Enable auto skip logic",
     )
-    parser.add_argument("-p", "--proxy", default="socks5h://127.0.0.1:10808")
+    parser.add_argument(
+        "-p",
+        "--proxy",
+        default="socks5h://127.0.0.1:{port}",
+        help="Proxy URL template (use {port} to inject the socks port)",
+    )
     parser.add_argument("-w", "--xray-startup-delay", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument(
         "--proxy-ready-timeout",
@@ -1009,6 +1064,21 @@ def main():
     options.config_validated = False
     if len(sys.argv) == 1 or not options.ip_file or not options.config:
         options = configure_interactive(options)
+    options.config_template = load_config_template(options.config)
+    proxy_template_uses_port = "{port}" in options.proxy
+    config_uses_port = "PLACEHOLDER_PORT" in options.config_template
+    if proxy_template_uses_port and not config_uses_port:
+        parser.error("Proxy template uses {port} but config is missing PLACEHOLDER_PORT.")
+    static_host = None
+    static_port = None
+    if not proxy_template_uses_port:
+        static_host, static_port = parse_proxy_host_port(options.proxy)
+        if config_uses_port and static_port is None:
+            parser.error("Config uses PLACEHOLDER_PORT but --proxy does not include a port.")
+    options.static_socks_port = static_port or DEFAULT_SOCKS_PORT
+    options.dynamic_proxy = proxy_template_uses_port
+    options.port_allocator = PortAllocator() if options.dynamic_proxy else None
+    options.validation_socks_port = options.static_socks_port or DEFAULT_SOCKS_PORT
     options.xray_bin = resolve_xray_binary(options.xray_bin)
     options.out = ensure_output_path(options.out)
 
@@ -1069,7 +1139,10 @@ def main():
             print(f"Download URL: {options.download_url}")
         if options.upload:
             print(f"Upload URL: {options.upload_url}")
-        print(f"Proxy: {options.proxy}")
+        if options.dynamic_proxy:
+            print(f"Proxy template: {options.proxy}")
+        else:
+            print(f"Proxy: {options.proxy}")
         print(f"Output: {options.out}")
 
         ranges = parse_ip_lines(options.ip_file)
