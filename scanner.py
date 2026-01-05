@@ -29,9 +29,10 @@ DEFAULT_TEST_DIR = os.path.join(os.path.expanduser("~"), ".json-scanner", "test-
 DEFAULT_TEST_FILENAME = "test.bin"
 RESULTS_DIRNAME = "result"
 RANDOM_SHUFFLE_LIMIT = 100000
-CONNECT_TIMEOUT_SECONDS = 3
-MAX_TIME_SECONDS = 6
+CONNECT_TIMEOUT_SECONDS = 5
+MAX_TIME_SECONDS = 20
 DEFAULT_SOCKS_PORT = 10808
+SPEED_LIMIT_MULTIPLIER = 1.1
 
 
 @dataclass
@@ -399,6 +400,9 @@ def test_download(url, proxy, min_kbps, download_bytes):
         "--max-time",
         str(MAX_TIME_SECONDS),
     ]
+    if min_kbps and min_kbps > 0:
+        limit_bps = int(math.ceil(min_kbps * 1024 * SPEED_LIMIT_MULTIPLIER))
+        args.extend(["--limit-rate", str(limit_bps)])
     if download_bytes and download_bytes > 0:
         args.extend(["--range", f"0-{download_bytes - 1}"])
     args.append(url)
@@ -459,6 +463,44 @@ def test_upload(url, proxy, size_kb, min_kbps):
     if min_kbps and speed_kbps < min_kbps:
         return False, speed_kbps, http_code, f"below minimum ({min_kbps} KB/s)"
     return True, speed_kbps, http_code, ""
+
+
+def test_real_delay(url, proxy):
+    args = [
+        "curl",
+        "-o",
+        "/dev/null",
+        "-s",
+        "-w",
+        "%{time_total} %{http_code}",
+        "--proxy",
+        proxy,
+        "--connect-timeout",
+        str(CONNECT_TIMEOUT_SECONDS),
+        "--max-time",
+        str(MAX_TIME_SECONDS),
+        url,
+    ]
+    result = run_curl(args)
+    stdout = result.stdout.decode(errors="ignore").strip()
+    stderr = result.stderr.decode(errors="ignore").strip()
+    if result.returncode != 0:
+        error = stderr or f"curl exited with {result.returncode}"
+        return False, 0.0, None, error
+    parts = stdout.split()
+    if len(parts) != 2:
+        error = stderr or f"unexpected curl output: {stdout}"
+        return False, 0.0, None, error
+    try:
+        time_seconds = float(parts[0])
+    except ValueError:
+        error = stderr or f"unexpected curl output: {stdout}"
+        return False, 0.0, None, error
+    http_code = parts[1]
+    if not is_success_http_code(http_code):
+        return False, 0.0, http_code, f"HTTP {http_code}"
+    delay_ms = time_seconds * 1000
+    return True, delay_ms, http_code, ""
 
 
 def select_download_bytes(options):
@@ -583,6 +625,10 @@ def format_speed(speed_kbps):
     return f"{speed_kbps:.2f} KB/s"
 
 
+def format_delay(delay_ms):
+    return f"{delay_ms:.2f} ms"
+
+
 def summarize_test(name, result, extra=""):
     if result is None:
         return f"{name}: skipped"
@@ -591,6 +637,22 @@ def summarize_test(name, result, extra=""):
     code = format_http_code(result.get("http_code"))
     message = result.get("error", "").strip()
     detail_bits = [speed, code]
+    if extra:
+        detail_bits.append(extra)
+    detail = ", ".join(bit for bit in detail_bits if bit)
+    if message:
+        return f"{name}: {status} ({detail}) - {message}"
+    return f"{name}: {status} ({detail})"
+
+
+def summarize_delay_test(name, result, extra=""):
+    if result is None:
+        return f"{name}: skipped"
+    status = "ok" if result["ok"] else "fail"
+    delay = format_delay(result["delay_ms"]) if result["delay_ms"] else "0.00 ms"
+    code = format_http_code(result.get("http_code"))
+    message = result.get("error", "").strip()
+    detail_bits = [delay, code]
     if extra:
         detail_bits.append(extra)
     detail = ", ".join(bit for bit in detail_bits if bit)
@@ -625,6 +687,7 @@ def scan_ip(ip_value, options):
         success = True
         download_speed = 0.0
         upload_speed = 0.0
+        delay_ms = 0.0
         details = {}
         try:
             if options.download:
@@ -663,11 +726,24 @@ def scan_ip(ip_value, options):
                     "size_kb": options.upload_size_kb,
                 }
                 success = success and upload_ok
+            if options.real_delay:
+                delay_ok, delay_ms, http_code, error = test_real_delay(
+                    options.real_delay_url,
+                    proxy_url,
+                )
+                details["real_delay"] = {
+                    "ok": delay_ok,
+                    "delay_ms": delay_ms,
+                    "http_code": http_code,
+                    "error": error,
+                    "url": options.real_delay_url,
+                }
+                success = success and delay_ok
         finally:
             xray_log = stop_xray(process, config_path, log_path)
             if xray_log and not success:
                 details["xray_log"] = xray_log
-        return ip_value, success, download_speed, upload_speed, details
+        return ip_value, success, download_speed, upload_speed, delay_ms, details
     finally:
         if options.dynamic_proxy:
             options.port_allocator.release(socks_port)
@@ -686,16 +762,15 @@ def should_skip(range_size, scanned, success_count, start_time, auto_skip):
     return False
 
 
-def format_result_line(ip_value, download_speed, upload_speed, options):
-    if options.download and options.upload:
-        return (
-            f"{ip_value},"
-            f"{format_speed(download_speed)},"
-            f"{format_speed(upload_speed)}"
-        )
+def format_result_line(ip_value, download_speed, upload_speed, delay_ms, options):
+    fields = [str(ip_value)]
     if options.download:
-        return f"{ip_value},{format_speed(download_speed)}"
-    return f"{ip_value},{format_speed(upload_speed)}"
+        fields.append(format_speed(download_speed))
+    if options.upload:
+        fields.append(format_speed(upload_speed))
+    if options.real_delay:
+        fields.append(format_delay(delay_ms))
+    return ",".join(fields)
 
 
 def iter_range_items(range_item, options):
@@ -775,18 +850,26 @@ def scan_range(range_item, options, output_lock, output_handle):
                     futures.pop(future, None)
                     scanned += 1
                     try:
-                        ip_value, success, download_speed, upload_speed, details = future.result()
+                        (
+                            ip_value,
+                            success,
+                            download_speed,
+                            upload_speed,
+                            delay_ms,
+                            details,
+                        ) = future.result()
                     except Exception:
                         ip_value = None
                         success = False
                         download_speed = 0.0
                         upload_speed = 0.0
+                        delay_ms = 0.0
                         details = {"error": "Unexpected worker failure."}
                     if success:
                         success_count += 1
                         with output_lock:
                             output_handle.write(
-                                f"{format_result_line(ip_value, download_speed, upload_speed, options)}\n"
+                                f"{format_result_line(ip_value, download_speed, upload_speed, delay_ms, options)}\n"
                             )
                             output_handle.flush()
                     if ip_value is not None:
@@ -808,6 +891,13 @@ def scan_range(range_item, options, output_lock, output_handle):
                                 )
                             else:
                                 summary_bits.append("ul -")
+                        if options.real_delay:
+                            if details.get("real_delay"):
+                                summary_bits.append(
+                                    f"delay {format_delay(details['real_delay']['delay_ms'])}"
+                                )
+                            else:
+                                summary_bits.append("delay -")
                         summary = " | ".join(summary_bits)
                         print(
                             format_status_line(
@@ -827,6 +917,8 @@ def scan_range(range_item, options, output_lock, output_handle):
                         if details.get("upload"):
                             extra = f"size {details['upload']['size_kb']} KB"
                             print(summarize_test("  upload", details["upload"], extra=extra))
+                        if details.get("real_delay"):
+                            print(summarize_delay_test("  real delay", details["real_delay"]))
                         if details.get("xray_log"):
                             print("  xray log:")
                             for line in details["xray_log"].splitlines():
@@ -874,10 +966,20 @@ def build_parser():
     parser.add_argument("-t", "--threads", type=int, default=10, help="Parallel threads")
     parser.add_argument("-d", "--download", action="store_true", help="Enable download test")
     parser.add_argument("-u", "--upload", action="store_true", help="Enable upload test")
+    parser.add_argument(
+        "--real-delay",
+        action="store_true",
+        help="Enable real delay test (skips download test)",
+    )
     parser.add_argument("-D", "--download-url")
     parser.add_argument(
         "--download-url-list",
         help="Path to a file with one download URL per line (round-robin)",
+    )
+    parser.add_argument(
+        "--real-delay-url",
+        default="https://www.gstatic.com/generate_204",
+        help="URL to use for real delay test",
     )
     parser.add_argument("-U", "--upload-url")
     parser.add_argument("-S", "--upload-size-kb", type=int, default=256)
@@ -957,7 +1059,7 @@ def build_parser():
     parser.add_argument(
         "--proxy-ready-timeout",
         type=float,
-        default=3.0,
+        default=6.0,
         help=argparse.SUPPRESS,
     )
     parser.add_argument("-o", "--out", default=None, help="Output file")
@@ -1020,12 +1122,16 @@ def configure_interactive(options):
     if not options.config:
         options.config = prompt_text("Xray JSON template path", required=True)
 
-    if not options.download and not options.upload:
+    if not options.download and not options.upload and not options.real_delay:
         options.download = prompt_bool("Enable download test?", default=True)
         options.upload = prompt_bool("Enable upload test?", default=False)
-        if not options.download and not options.upload:
+        options.real_delay = prompt_bool("Enable real delay test?", default=False)
+        if not options.download and not options.upload and not options.real_delay:
             print("At least one test must be enabled.")
             options.download = True
+
+    if options.real_delay:
+        options.download = False
 
     if options.download and not options.download_url:
         options.download_url = prompt_text(
@@ -1071,6 +1177,11 @@ def configure_interactive(options):
     options.min_kbps = prompt_int("Minimum speed (KB/s)", options.min_kbps)
     if options.upload:
         options.upload_size_kb = prompt_int("Upload size (KB)", options.upload_size_kb)
+    if options.real_delay:
+        options.real_delay_url = prompt_text(
+            "Real delay URL",
+            default=options.real_delay_url,
+        )
     options.download_bytes = 0
     options.random = options.random or prompt_bool("Randomize IP order?", default=options.random)
     options.auto_skip = options.auto_skip or prompt_bool("Enable auto skip?", default=options.auto_skip)
@@ -1104,6 +1215,8 @@ def main():
     options.download_urls = []
     options.download_url_cycle = None
     options.download_url_lock = threading.Lock()
+    if options.real_delay:
+        options.download = False
     if options.download_url and options.download_url_list:
         parser.error("Use either --download-url or --download-url-list, not both.")
     if options.download_url_list:
@@ -1113,8 +1226,8 @@ def main():
         options.download_url = options.download_urls[0]
         options.download_url_cycle = itertools.cycle(options.download_urls)
 
-    if not options.download and not options.upload:
-        parser.error("At least one of --download or --upload must be set.")
+    if not options.download and not options.upload and not options.real_delay:
+        parser.error("At least one of --download, --upload, or --real-delay must be set.")
 
     server = None
     try:
@@ -1175,6 +1288,8 @@ def main():
                 )
         if options.upload:
             print(f"Upload URL: {options.upload_url}")
+        if options.real_delay:
+            print(f"Real delay URL: {options.real_delay_url}")
         if options.dynamic_proxy:
             print(f"Proxy template: {options.proxy}")
         else:
