@@ -137,26 +137,42 @@ def resolve_xray_binary(xray_bin):
     if found:
         return found
 
-    cache_dir = os.path.join(os.path.expanduser("~"), ".json-scanner", "xray")
-    if os.path.isdir(cache_dir):
-        for root, _, files in os.walk(cache_dir):
-            if "xray" in files:
-                return os.path.join(root, "xray")
-            if "xray.exe" in files:
-                return os.path.join(root, "xray.exe")
+    cwd = os.getcwd()
+    for filename in ("xray", "xray.exe"):
+        candidate = os.path.join(cwd, filename)
+        if os.path.isfile(candidate):
+            return candidate
 
-    print("Xray binary not found.")
-    choice = input("Download Xray automatically? [Y/n]: ").strip().lower()
-    if choice in {"", "y", "yes"}:
-        os.makedirs(cache_dir, exist_ok=True)
-        return download_xray(cache_dir)
+    print("Xray binary not found. Downloading latest release for your platform...")
+    return download_xray(cwd)
 
-    manual_path = input("Enter the full path to the Xray binary: ").strip()
-    if not manual_path:
-        raise SystemExit("No binary path provided.")
-    if not os.path.isfile(manual_path):
-        raise SystemExit("Xray binary not found at the provided path.")
-    return manual_path
+
+def validate_xray_config(xray_bin, config_text):
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+    temp.write(config_text.encode("utf-8"))
+    temp.flush()
+    temp.close()
+    try:
+        result = subprocess.run(
+            [xray_bin, "-test", "-c", temp.name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    finally:
+        try:
+            os.unlink(temp.name)
+        except FileNotFoundError:
+            pass
+    if result.returncode == 0:
+        print("config has valid syntax")
+        return True
+    output = result.stderr.decode(errors="ignore").strip()
+    if not output:
+        output = result.stdout.decode(errors="ignore").strip()
+    if output:
+        print(output)
+    return False
 
 
 def run_xray(xray_bin, config_text):
@@ -317,7 +333,8 @@ def scan_ip(ip_value, options):
         return ip_value, False, 0.0, 0.0
     config_text = render_config(options.config, ip_value)
     process, config_path = run_xray(options.xray_bin, config_text)
-    time.sleep(options.xray_startup_delay)
+    if options.xray_startup_delay > 0:
+        time.sleep(options.xray_startup_delay)
     success = False
     download_speed = 0.0
     upload_speed = 0.0
@@ -360,6 +377,10 @@ def scan_range(label, items, options, output_lock, output_handle):
     range_size = len(items)
     if options.random:
         random.shuffle(items)
+    if items:
+        config_text = render_config(options.config, items[0])
+        if not validate_xray_config(options.xray_bin, config_text):
+            return
     start_time = time.time()
     scanned = 0
     success_count = 0
@@ -509,7 +530,7 @@ def build_parser():
         help="Enable auto skip logic",
     )
     parser.add_argument("-p", "--proxy", default="socks5h://127.0.0.1:10808")
-    parser.add_argument("-w", "--xray-startup-delay", type=float, default=0.5, help=argparse.SUPPRESS)
+    parser.add_argument("-w", "--xray-startup-delay", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("-o", "--out", default="success.txt", help="Output file")
     return parser
 
@@ -619,14 +640,11 @@ def configure_interactive(options):
     options.threads = prompt_int("Parallel threads", options.threads)
     options.proxy = prompt_text("Proxy URL", default=options.proxy)
     options.min_kbps = prompt_int("Minimum speed (KB/s)", options.min_kbps)
-    options.upload_size_kb = prompt_int("Upload size (KB)", options.upload_size_kb)
+    if options.upload:
+        options.upload_size_kb = prompt_int("Upload size (KB)", options.upload_size_kb)
     options.download_bytes = 0
     options.random = options.random or prompt_bool("Randomize IP order?", default=options.random)
     options.auto_skip = options.auto_skip or prompt_bool("Enable auto skip?", default=options.auto_skip)
-    options.xray_startup_delay = prompt_float(
-        "Xray startup delay (seconds)",
-        options.xray_startup_delay,
-    )
     options.out = prompt_text("Output file", default=options.out)
     return options
 
