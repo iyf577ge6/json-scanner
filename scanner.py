@@ -7,6 +7,7 @@ import os
 import platform
 import random
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -343,6 +344,27 @@ def ensure_test_file(path, size_mb):
             return
     with open(path, "wb") as handle:
         handle.truncate(target_size)
+
+
+def is_loopback_host(host):
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        ip_value = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip_value.is_loopback
+
+
+def detect_local_ip():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return None
 
 
 class LocalTestHandler(http.server.SimpleHTTPRequestHandler):
@@ -844,6 +866,19 @@ def main():
             (options.download and not options.download_url)
             or (options.upload and not options.upload_url)
         )
+        if use_local_server and is_loopback_host(options.local_test_host) and options.proxy:
+            detected_ip = detect_local_ip()
+            if detected_ip and not is_loopback_host(detected_ip):
+                print(
+                    "Local test host was loopback; using detected IP "
+                    f"{detected_ip} for proxy tests. Use --local-test-host to override."
+                )
+                options.local_test_host = detected_ip
+            else:
+                raise RuntimeError(
+                    "Local test host is loopback but proxy tests need a reachable host. "
+                    "Set --local-test-host to your public IP or use --download-url/--upload-url."
+                )
         if use_local_server:
             test_file_path = options.test_file_path
             if not test_file_path:
