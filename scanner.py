@@ -366,21 +366,28 @@ def scan_range(label, items, options, output_lock, output_handle):
 
 def build_parser():
     parser = argparse.ArgumentParser(description="IP scanner for Xray/V2Ray configs")
-    parser.add_argument("--ip-file", required=True, help="Path to IP list file")
-    parser.add_argument("--config", required=True, help="Path to Xray JSON template")
-    parser.add_argument("--xray-bin", default="xray", help="Path to Xray binary")
-    parser.add_argument("--threads", type=int, default=10, help="Parallel threads")
-    parser.add_argument("--download", action="store_true", help="Enable download test")
-    parser.add_argument("--upload", action="store_true", help="Enable upload test")
-    parser.add_argument("--download-url", default="https://speed.hetzner.de/100MB.bin")
-    parser.add_argument("--upload-url", default="https://httpbin.org/post")
-    parser.add_argument("--upload-size-kb", type=int, default=256)
-    parser.add_argument("--speed", type=int, dest="min_kbps", default=0, help="Min speed KB/s")
-    parser.add_argument("--random", action="store_true", help="Randomize IP order")
-    parser.add_argument("--autoskip", action="store_true", help="Enable auto skip logic")
-    parser.add_argument("--proxy", default="socks5h://127.0.0.1:10808")
-    parser.add_argument("--xray-startup-delay", type=float, default=0.5)
-    parser.add_argument("--out", default="success.txt", help="Output file")
+    parser.add_argument("-i", "--ip-file", required=True, help="Path to IP list file")
+    parser.add_argument("-c", "--config", required=True, help="Path to Xray JSON template")
+    parser.add_argument("-x", "--xray-bin", default="xray", help="Path to Xray binary")
+    parser.add_argument("-t", "--threads", type=int, default=10, help="Parallel threads")
+    parser.add_argument("-d", "--download", action="store_true", help="Enable download test")
+    parser.add_argument("-u", "--upload", action="store_true", help="Enable upload test")
+    parser.add_argument("-D", "--download-url", default="https://speed.hetzner.de/100MB.bin")
+    parser.add_argument("-U", "--upload-url", default="https://httpbin.org/post")
+    parser.add_argument("-S", "--upload-size-kb", type=int, default=256)
+    parser.add_argument(
+        "-s",
+        "--speed",
+        type=int,
+        dest="min_kbps",
+        default=0,
+        help="Min speed KB/s",
+    )
+    parser.add_argument("-r", "--random", action="store_true", help="Randomize IP order")
+    parser.add_argument("-a", "--autoskip", action="store_true", help="Enable auto skip logic")
+    parser.add_argument("-p", "--proxy", default="socks5h://127.0.0.1:10808")
+    parser.add_argument("-w", "--xray-startup-delay", type=float, default=0.5)
+    parser.add_argument("-o", "--out", default="success.txt", help="Output file")
     return parser
 
 

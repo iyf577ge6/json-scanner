@@ -130,32 +130,32 @@
 
 ## پارامترهای قابل تنظیم
 
-* `--threads` : تعداد Thread موازی
-* `--download` : فعال کردن تست دانلود
-* `--upload` : فعال کردن تست آپلود
-* `--speed` : سرعت حداقل (KB/s) برای قبول موفقیت
-* `--random` : تست تصادفی IPها
-* `--autoskip` : فعال‌سازی Auto Skip
-* `--ip-file` : مسیر فایل IPها
-* `--config` : مسیر فایل کانفیگ Xray
-* `--download-url` : آدرس فایل تست دانلود
-* `--upload-url` : آدرس تست آپلود
-* `--upload-size-kb` : حجم داده‌ی تست آپلود
-* `--xray-bin` : مسیر باینری Xray
-* `--proxy` : پراکسی محلی (پیش‌فرض socks5 روی 10808)
-* `--out` : خروجی نتایج موفق
+* `-t`/`--threads` : تعداد Thread موازی
+* `-d`/`--download` : فعال کردن تست دانلود
+* `-u`/`--upload` : فعال کردن تست آپلود
+* `-s`/`--speed` : سرعت حداقل (KB/s) برای قبول موفقیت
+* `-r`/`--random` : تست تصادفی IPها
+* `-a`/`--autoskip` : فعال‌سازی Auto Skip
+* `-i`/`--ip-file` : مسیر فایل IPها
+* `-c`/`--config` : مسیر فایل کانفیگ Xray
+* `-D`/`--download-url` : آدرس فایل تست دانلود
+* `-U`/`--upload-url` : آدرس تست آپلود
+* `-S`/`--upload-size-kb` : حجم داده‌ی تست آپلود
+* `-x`/`--xray-bin` : مسیر باینری Xray
+* `-p`/`--proxy` : پراکسی محلی (پیش‌فرض socks5 روی 10808)
+* `-o`/`--out` : خروجی نتایج موفق
 
 مثال اجرا:
 
 ```
-python3 scanner.py \\
-  --ip-file ips.txt \\
-  --config xray.json \\
-  --threads 20 \\
-  --download \\
-  --speed 500 \\
-  --random \\
-  --autoskip
+python3 scanner.py \
+  -i ips.txt \
+  -c xray.json \
+  -t 20 \
+  -d \
+  -s 500 \
+  -r \
+  -a
 ```
 
 ---
