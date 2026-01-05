@@ -40,6 +40,8 @@ class IpRange:
     kind: str
     label: str
     count: int
+    start_int: int
+    version: int
     iter_factory: callable
 
     def iter_ips(self):
@@ -71,6 +73,15 @@ def parse_ip_lines(path):
                         "cidr",
                         line,
                         count,
+                        start_int=(
+                            int(network.network_address)
+                            if (
+                                (network.version == 4 and network.prefixlen >= 31)
+                                or (network.version == 6 and network.prefixlen == 128)
+                            )
+                            else int(network.network_address) + 1
+                        ),
+                        version=network.version,
                         iter_factory=network.hosts,
                     )
                 )
@@ -89,6 +100,8 @@ def parse_ip_lines(path):
                         "range",
                         line,
                         count,
+                        start_int=int(start),
+                        version=start.version,
                         iter_factory=lambda start=start, count=count: (
                             ipaddress.ip_address(int(start) + offset) for offset in range(count)
                         ),
@@ -101,6 +114,8 @@ def parse_ip_lines(path):
                     "single",
                     line,
                     1,
+                    start_int=int(ip),
+                    version=ip.version,
                     iter_factory=lambda ip=ip: iter((ip,)),
                 )
             )
@@ -829,21 +844,32 @@ def format_result_line(ip_value, download_speed, upload_speed, delay_ms, options
         fields.append(format_delay(delay_ms))
     return ",".join(fields)
 
+def iter_random_offsets(count):
+    if count <= 1:
+        return iter(range(count))
+    if count <= RANDOM_SHUFFLE_LIMIT:
+        offsets = list(range(count))
+        random.shuffle(offsets)
+        return iter(offsets)
+    start = random.randrange(count)
+    step = random.randrange(1, count)
+    while math.gcd(step, count) != 1:
+        step = random.randrange(1, count)
+    return ((start + step * index) % count for index in range(count))
+
 
 def iter_range_items(range_item, options):
-    if options.random and range_item.count <= RANDOM_SHUFFLE_LIMIT:
-        items = list(range_item.iter_ips())
-        random.shuffle(items)
-        return iter(items)
-    if options.random and range_item.count > RANDOM_SHUFFLE_LIMIT:
-        print(
-            f"{range_item.label}: random mode skipped for large range "
-            f"({range_item.count} IPs)."
+    random_mode = options.random or options.auto_skip
+    if random_mode:
+        offsets = iter_random_offsets(range_item.count)
+        return (
+            ipaddress.ip_address(range_item.start_int + offset)
+            for offset in offsets
         )
     return range_item.iter_ips()
 
 
-def scan_range(range_item, options, output_lock, output_handle):
+def scan_range(range_item, options, output_lock, output_handle, raw_output_handle):
     range_size = range_item.count
     label = range_item.label
     if range_size:
@@ -910,6 +936,8 @@ def scan_range(range_item, options, output_lock, output_handle):
                                 f"{format_result_line(ip_value, download_speed, upload_speed, delay_ms, options)}\n"
                             )
                             output_handle.flush()
+                            raw_output_handle.write(f"{ip_value}\n")
+                            raw_output_handle.flush()
                     if ip_value is not None:
                         clear_status_bar(options)
                         status_text = "OK" if success else "FAIL"
@@ -1005,6 +1033,13 @@ def ensure_output_path(out_path):
         candidate = os.path.join(result_dir, f"{timestamp}-{suffix}.txt")
         if not os.path.exists(candidate):
             return candidate
+
+
+def ensure_raw_output_path(out_path):
+    base, ext = os.path.splitext(out_path)
+    if ext:
+        return f"{base}-raw{ext}"
+    return f"{out_path}-raw"
 
 
 def build_parser():
@@ -1175,7 +1210,7 @@ def configure_interactive(options):
         options.real_delay = prompt_bool("Enable real delay test?", default=False)
         if not options.real_delay:
             options.download = prompt_bool("Enable download test?", default=True)
-        options.upload = prompt_bool("Enable upload test?", default=False)
+            options.upload = prompt_bool("Enable upload test?", default=False)
         if not options.download and not options.upload and not options.real_delay:
             print("At least one test must be enabled.")
             options.download = True
@@ -1224,7 +1259,6 @@ def configure_interactive(options):
     options.xray_bin = prompt_text("Xray binary path", default=options.xray_bin)
     options.threads = prompt_int("Parallel threads", options.threads)
     options.proxy = prompt_text("Proxy URL", default=options.proxy)
-    options.min_kbps = prompt_int("Minimum speed (KB/s)", options.min_kbps)
     if options.upload:
         options.upload_size_kb = prompt_int("Upload size (KB)", options.upload_size_kb)
     if options.real_delay:
@@ -1232,6 +1266,8 @@ def configure_interactive(options):
             "Real delay URL",
             default=options.real_delay_url,
         )
+    if not options.real_delay or options.download or options.upload:
+        options.min_kbps = prompt_int("Minimum speed (KB/s)", options.min_kbps)
     options.download_bytes = 0
     options.random = options.random or prompt_bool("Randomize IP order?", default=options.random)
     options.auto_skip = options.auto_skip or prompt_bool("Enable auto skip?", default=options.auto_skip)
@@ -1266,6 +1302,7 @@ def main():
     options.validation_socks_port = options.static_socks_port or DEFAULT_SOCKS_PORT
     options.xray_bin = resolve_xray_binary(options.xray_bin)
     options.out = ensure_output_path(options.out)
+    options.raw_out = ensure_raw_output_path(options.out)
     options.download_urls = []
     options.download_url_cycle = None
     options.download_url_lock = threading.Lock()
@@ -1349,6 +1386,7 @@ def main():
         else:
             print(f"Proxy: {options.proxy}")
         print(f"Output: {options.out}")
+        print(f"Raw output: {options.raw_out}")
 
         ranges = parse_ip_lines(options.ip_file)
         options.total_ips = sum(range_item.count for range_item in ranges)
@@ -1356,11 +1394,13 @@ def main():
         if options.total_ips:
             print(colorize("Xray core started. Logs will show only on errors.", COLOR_BLUE))
             print(colorize(f"Total IPs: {options.total_ips}", COLOR_BRIGHT_CYAN))
-        with open(options.out, "w", encoding="utf-8") as output_handle:
+        with open(options.out, "w", encoding="utf-8") as output_handle, open(
+            options.raw_out, "w", encoding="utf-8"
+        ) as raw_output_handle:
             for range_item in ranges:
                 if options.stop_event.is_set():
                     break
-                scan_range(range_item, options, output_lock, output_handle)
+                scan_range(range_item, options, output_lock, output_handle, raw_output_handle)
     except KeyboardInterrupt:
         options.stop_event.set()
         clear_status_bar(options)
